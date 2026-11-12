@@ -1,0 +1,23 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@keyframes urgent-red-blink {
+  0%, 100% {
+    background-color: #fda4af; /* medium-light red/rose (rose-300) */
+    color: #881337; /* deep crimson text (rose-900) - optimal readability */
+    border-color: #f43f5e; /* rose-500 border */
+    box-shadow: 0 0 10px rgba(244, 63, 94, 0.35);
+  }
+  50% {
+    background-color: #ffe4e6; /* soft light red/rose (rose-100) */
+    color: #9f1239; /* dark ruby text (rose-800) */
+    border-color: #fecdd3; /* rose-200 border */
+    box-shadow: 0 0 0px transparent;
+  }
+}
+
+.animate-urgent-blink {
+  animation: urgent-red-blink 1.4s ease-in-out infinite;
+}
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }

@@ -1,0 +1,6 @@
+{
+  "name": "Premier League Auction Simulation",
+  "description": "Full-stack live cricket auction simulation with real-time bidding engine, team squad tracking, and qualification scoreboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
