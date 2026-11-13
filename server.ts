@@ -432,12 +432,11 @@ function getInitialPlayers(): Player[] {
       lotName: null,
       imageUrl: 'https://images.unsplash.com/photo-1522075469751-3a6694fb2f61?w=400&auto=format&fit=crop&q=80',
     },
-
     // --- AUCTION PLAYERS (12 players in 3 lots of 4 players, starting from #1 up to #12) ---
     // LOT 1: Premium Players
     {
       id: 1,
-      name: 'H. Pandya',
+      name: 'Hardik Pandya',
       role: 'Allrounder',
       type: 'Auction',
       teamId: null,
@@ -451,7 +450,7 @@ function getInitialPlayers(): Player[] {
     },
     {
       id: 2,
-      name: 'R. Singh',
+      name: 'Arshdeep Singh',
       role: 'Bowler',
       type: 'Auction',
       teamId: null,
@@ -461,11 +460,11 @@ function getInitialPlayers(): Player[] {
       isSold: false,
       lotNumber: 1,
       lotName: 'Premium Players',
-      imageUrl: playerImg('r-singh.webp'),
+      imageUrl: playerImg('arshdeep-singh.webp'),
     },
     {
       id: 3,
-      name: 'K. Rahul',
+      name: 'K. L. Rahul',
       role: 'Wicketkeeper',
       type: 'Auction',
       teamId: null,
@@ -479,7 +478,7 @@ function getInitialPlayers(): Player[] {
     },
     {
       id: 4,
-      name: 'R. Jadeja',
+      name: 'Axar Patel',
       role: 'Allrounder',
       type: 'Auction',
       teamId: null,
@@ -489,13 +488,13 @@ function getInitialPlayers(): Player[] {
       isSold: false,
       lotNumber: 1,
       lotName: 'Premium Players',
-      imageUrl: playerImg('r-jadeja.webp'),
+      imageUrl: playerImg('axar-patel.webp'),
     },
 
     // LOT 2: Star Players
     {
       id: 5,
-      name: 'J. Bumrah',
+      name: 'Jasprit Bumrah',
       role: 'Bowler',
       type: 'Auction',
       teamId: null,
@@ -509,7 +508,7 @@ function getInitialPlayers(): Player[] {
     },
     {
       id: 6,
-      name: 'S. Mandhana',
+      name: 'Shubman Gill',
       role: 'Batsman',
       type: 'Auction',
       teamId: null,
@@ -519,11 +518,11 @@ function getInitialPlayers(): Player[] {
       isSold: false,
       lotNumber: 2,
       lotName: 'Star Players',
-      imageUrl: playerImg('s-mandhana.webp'),
+      imageUrl: playerImg('shubman-gill.webp'),
     },
     {
       id: 7,
-      name: 'M. S. Dhoni',
+      name: 'Rishabh Pant',
       role: 'Wicketkeeper',
       type: 'Auction',
       teamId: null,
@@ -533,11 +532,11 @@ function getInitialPlayers(): Player[] {
       isSold: false,
       lotNumber: 2,
       lotName: 'Star Players',
-      imageUrl: playerImg('ms-dhoni.webp'),
+      imageUrl: playerImg('rishabh-pant.webp'),
     },
     {
       id: 8,
-      name: 'A. Gardner',
+      name: 'Glenn Maxwell',
       role: 'Allrounder',
       type: 'Auction',
       teamId: null,
@@ -547,13 +546,13 @@ function getInitialPlayers(): Player[] {
       isSold: false,
       lotNumber: 2,
       lotName: 'Star Players',
-      imageUrl: playerImg('a-gardner.webp'),
+      imageUrl: playerImg('glenn-maxwell.webp'),
     },
 
     // LOT 3: Elite Players
     {
       id: 9,
-      name: 'V. Kohli',
+      name: 'Virat Kohli',
       role: 'Batsman',
       type: 'Auction',
       teamId: null,
@@ -567,7 +566,7 @@ function getInitialPlayers(): Player[] {
     },
     {
       id: 10,
-      name: 'B. Stokes',
+      name: 'Ben Stokes',
       role: 'Allrounder',
       type: 'Auction',
       teamId: null,
@@ -581,7 +580,7 @@ function getInitialPlayers(): Player[] {
     },
     {
       id: 11,
-      name: 'H. Kaur',
+      name: 'Abhishek Sharma',
       role: 'Batsman',
       type: 'Auction',
       teamId: null,
@@ -591,11 +590,11 @@ function getInitialPlayers(): Player[] {
       isSold: false,
       lotNumber: 3,
       lotName: 'Elite Players',
-      imageUrl: playerImg('h-kaur.webp'),
+      imageUrl: playerImg('abhishek-sharma.webp'),
     },
     {
       id: 12,
-      name: 'R. Sharma',
+      name: 'Travis Head',
       role: 'Batsman',
       type: 'Auction',
       teamId: null,
@@ -605,7 +604,7 @@ function getInitialPlayers(): Player[] {
       isSold: false,
       lotNumber: 3,
       lotName: 'Elite Players',
-      imageUrl: playerImg('r-sharma.webp'),
+      imageUrl: playerImg('travis-head.webp'),
     },
   ];
 }
@@ -699,13 +698,15 @@ class AuctionDatabase {
     this.recalculateAllTeams();
   }
 
-  // Keeps imageUrl in an already-saved database in sync with the seed above,
-  // so editing a photo path in getInitialPlayers() takes effect on restart without a DB reset.
+  // Keeps imageUrl AND name in an already-saved database in sync with the seed above,
+  // so editing a photo path or a player name in getInitialPlayers() takes effect on restart without a DB reset.
   private syncImageUrls() {
-    const seed = new Map(getInitialPlayers().map((p) => [p.id, p.imageUrl]));
+    const seed = new Map(getInitialPlayers().map((p) => [p.id, p]));
     for (const p of this.state.players) {
-      const url = seed.get(p.id);
-      if (url && p.imageUrl !== url) p.imageUrl = url;
+      const s = seed.get(p.id);
+      if (!s) continue;
+      if (p.imageUrl !== s.imageUrl) p.imageUrl = s.imageUrl;
+      if (p.name !== s.name) p.name = s.name;
     }
   }
 
