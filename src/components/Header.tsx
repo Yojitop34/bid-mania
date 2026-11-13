@@ -378,7 +378,7 @@ export default function Header({
             </div>
 
             <p className="text-xs text-slate-600 mb-5 leading-relaxed">
-              As Admin, you can adjust the current remaining purse for all teams simultaneously or customize individual teams in real time. Initial budget adjusts automatically to match any auction spending.
+              As Admin, you can adjust the current remaining purse for all teams simultaneously or customize individual teams in real time. Initial budget stays constant while remaining purse updates immediately.
             </p>
 
             {savedSuccess && (

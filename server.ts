@@ -675,6 +675,9 @@ class AuctionDatabase {
           if (!team.loginCode) {
             team.loginCode = defaultCodes[team.id] || `${team.code.replace(/\s+/g, '').toUpperCase()}777`;
           }
+          if (team.adjustedBudget === undefined) {
+            team.adjustedBudget = team.baseBudget;
+          }
         }
         if (!this.state.activeAuction.biddingType) {
           this.state.activeAuction.biddingType = 'online';
@@ -763,8 +766,8 @@ class AuctionDatabase {
       const totalVal = teamPlayers.reduce((sum, p) => sum + p.valuePoints, 0);
 
       team.totalSpent = auctionSpent;
-      team.remainingBudget = team.baseBudget - auctionSpent;
-      team.adjustedBudget = team.baseBudget;
+      const effectiveBudget = team.adjustedBudget ?? team.baseBudget;
+      team.remainingBudget = Math.max(0, effectiveBudget - auctionSpent);
       team.totalValue = totalVal;
 
       const qual = calculateQualification(team.id, this.state.players);
@@ -790,25 +793,23 @@ class AuctionDatabase {
   }
 
   public updateTeamPurse(teamId: string, newRemainingPurse: number) {
-  if (!Number.isFinite(newRemainingPurse)) throw new Error('Invalid amount');
+    if (!Number.isFinite(newRemainingPurse)) throw new Error('Invalid amount');
     const team = this.state.teams.find((t) => t.id === teamId || t.code === teamId);
     if (team) {
       const safeRemaining = Math.max(0, newRemainingPurse);
       team.remainingBudget = safeRemaining;
-      team.baseBudget = safeRemaining + team.totalSpent;
-      team.adjustedBudget = team.baseBudget;
+      team.adjustedBudget = safeRemaining + team.totalSpent;
       this.save();
     }
   }
 
   public updateAllTeamsPurse(newRemainingPurse: number) {
-  if (!Number.isFinite(newRemainingPurse)) throw new Error('Invalid amount');
+    if (!Number.isFinite(newRemainingPurse)) throw new Error('Invalid amount');
     const safeRemaining = Math.max(0, newRemainingPurse);
     this.state.universalPurse = safeRemaining;
     for (const team of this.state.teams) {
       team.remainingBudget = safeRemaining;
-      team.baseBudget = safeRemaining + team.totalSpent;
-      team.adjustedBudget = team.baseBudget;
+      team.adjustedBudget = safeRemaining + team.totalSpent;
     }
     this.save();
   }
