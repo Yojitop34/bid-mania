@@ -67,4 +67,5 @@ export interface UserAuth {
   role: 'admin' | 'participant';
   gameCode?: string;
   selectedTeam?: string; // e.g. 'Team A', 'Team B', 'Team C', 'Team D'
+  sessionToken?: string;
 }

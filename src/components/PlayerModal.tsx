@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Player, ActiveAuction, UserAuth } from '../types';
-import { X, Gavel, CheckCircle, Clock, RotateCcw } from 'lucide-react';
+import { X, Gavel, CheckCircle, Clock, RotateCcw, AlertCircle } from 'lucide-react';
 
 interface PlayerModalProps {
   player: Player;
@@ -11,9 +11,12 @@ interface PlayerModalProps {
     playerId: number,
     durationSeconds: number,
     biddingType: 'online' | 'offline'
-  ) => void;
+  ) => boolean | void;
   onReAuction?: (playerId: number) => void;
   onOpenLiveAuction: () => void;
+  isStartingBid?: boolean;
+  startError?: string | null;
+  onClearStartError?: () => void;
 }
 
 export default function PlayerModal({
@@ -24,6 +27,9 @@ export default function PlayerModal({
   onStartBid,
   onReAuction,
   onOpenLiveAuction,
+  isStartingBid = false,
+  startError = null,
+  onClearStartError,
 }: PlayerModalProps) {
   const [biddingType, setBiddingType] = useState<'online' | 'offline'>('online');
   const [selectedDuration, setSelectedDuration] = useState<number>(30);
@@ -159,8 +165,12 @@ export default function PlayerModal({
                   </label>
                   <select
                     value={biddingType}
-                    onChange={(e) => setBiddingType(e.target.value as 'online' | 'offline')}
-                    className="w-full px-3 py-2 text-xs font-semibold bg-white border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 cursor-pointer text-slate-800"
+                    disabled={isStartingBid}
+                    onChange={(e) => {
+                      setBiddingType(e.target.value as 'online' | 'offline');
+                      onClearStartError?.();
+                    }}
+                    className="w-full px-3 py-2 text-xs font-semibold bg-white border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 cursor-pointer text-slate-800 disabled:opacity-60"
                   >
                     <option value="online">Online</option>
                     <option value="offline">Offline</option>
@@ -176,8 +186,12 @@ export default function PlayerModal({
                     </label>
                     <select
                       value={selectedDuration}
-                      onChange={(e) => setSelectedDuration(Number(e.target.value))}
-                      className="w-full px-3 py-2 text-xs font-semibold bg-white border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 cursor-pointer text-slate-800"
+                      disabled={isStartingBid}
+                      onChange={(e) => {
+                        setSelectedDuration(Number(e.target.value));
+                        onClearStartError?.();
+                      }}
+                      className="w-full px-3 py-2 text-xs font-semibold bg-white border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 cursor-pointer text-slate-800 disabled:opacity-60"
                     >
                       <option value={30}>30 seconds (Default)</option>
                       <option value={60}>1 minute</option>
@@ -187,16 +201,26 @@ export default function PlayerModal({
                   </div>
                 )}
 
+                {startError && (
+                  <div className="bg-rose-50 border border-rose-200 text-rose-700 text-xs p-2.5 rounded-xl flex items-start gap-2 text-left">
+                    <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    <span>{startError}</span>
+                  </div>
+                )}
+
                 <button
+                  type="button"
+                  disabled={isStartingBid}
                   onClick={() => {
                     onStartBid(player.id, selectedDuration, biddingType);
-                    onClose();
                   }}
-                  className="w-full py-2.5 bg-blue-600 hover:bg-blue-500 active:scale-95 text-white font-semibold text-xs rounded-xl shadow-xs transition flex items-center justify-center gap-2 cursor-pointer"
+                  className="w-full py-2.5 bg-blue-600 hover:bg-blue-500 active:scale-95 text-white font-semibold text-xs rounded-xl shadow-xs transition flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                 >
                   <Gavel className="w-4 h-4" />
                   <span>
-                    {biddingType === 'offline'
+                    {isStartingBid
+                      ? 'Starting Bid...'
+                      : biddingType === 'offline'
                       ? 'Start Bid (Offline)'
                       : `Start Bid (${
                           selectedDuration === 30

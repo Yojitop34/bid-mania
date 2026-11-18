@@ -1,9 +1,16 @@
-import express from 'express';
-import { createServer } from 'http';
+import express, { type Request, type Response, type NextFunction } from 'express';
+import { createServer, type IncomingMessage } from 'http';
+import net from 'net';
 import { WebSocketServer, WebSocket } from 'ws';
+import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
+
+if (process.env.NODE_ENV !== 'production') {
+  dotenv.config();
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -63,13 +70,53 @@ export interface ActiveAuction {
 export interface DatabaseState {
   config: {
     gameCode: string;
-    adminCode: string;
+    adminCodeHash?: string;
+    adminCode?: string;
   };
   universalPurse?: number;
   teams: Team[];
   players: Player[];
   activeAuction: ActiveAuction;
   auditLogs: { id: string; action: string; timestamp: string; details: any }[];
+}
+
+function getDefaultAdminCode(): string | null {
+  const raw = process.env.ADMIN_DEFAULT_CODE;
+  if (typeof raw !== 'string') return null;
+  const normalized = raw.trim().toUpperCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function getAdminCodeChangePassword(): string | null {
+  const raw = process.env.ADMIN_CODE_CHANGE_PASSWORD;
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  return raw;
+}
+
+function hashAdminCode(normalizedCode: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(normalizedCode, salt, 64).toString('hex');
+  return `scrypt:${salt}:${derived}`;
+}
+
+function isValidAdminCodeHashFormat(storedHash: unknown): storedHash is string {
+  if (typeof storedHash !== 'string') return false;
+  const parts = storedHash.split(':');
+  return (
+    parts.length === 3 &&
+    parts[0] === 'scrypt' &&
+    /^[0-9a-f]{32}$/i.test(parts[1]) &&
+    /^[0-9a-f]{128}$/i.test(parts[2])
+  );
+}
+
+function verifyAdminCodeHash(normalizedCode: string, storedHash: unknown): boolean {
+  if (!isValidAdminCodeHashFormat(storedHash)) return false;
+  const [, salt, hexHash] = storedHash.split(':');
+  const expectedBuf = Buffer.from(hexHash, 'hex');
+  const actualBuf = crypto.scryptSync(normalizedCode, salt, 64);
+  if (actualBuf.length !== expectedBuf.length) return false;
+  return crypto.timingSafeEqual(actualBuf, expectedBuf);
 }
 
 const DATA_DIR = path.join(__dirname, 'data');
@@ -660,9 +707,26 @@ class AuctionDatabase {
       try {
         const raw = fs.readFileSync(DB_FILE, 'utf-8');
         this.state = JSON.parse(raw);
-        // Ensure static game codes are permanent
+        if (!this.state.config || typeof this.state.config !== 'object') {
+          this.state.config = { gameCode: 'APL2026' };
+        }
+        // Ensure static game code is permanent and plaintext adminCode is never retained
         this.state.config.gameCode = 'APL2026';
-        this.state.config.adminCode = 'ADMIN777';
+        let needsSave = false;
+        if ('adminCode' in this.state.config) {
+          delete this.state.config.adminCode;
+          needsSave = true;
+        }
+        if (!isValidAdminCodeHashFormat(this.state.config.adminCodeHash)) {
+          const defaultAdminCode = getDefaultAdminCode();
+          if (defaultAdminCode) {
+            this.state.config.adminCodeHash = hashAdminCode(defaultAdminCode);
+          } else {
+            delete this.state.config.adminCodeHash;
+            console.error('ADMIN_DEFAULT_CODE is not configured; admin login is disabled.');
+          }
+          needsSave = true;
+        }
         // Ensure teams have loginCode initialized
         const defaultCodes: Record<string, string> = {
           team_a: 'TEAMA777',
@@ -683,6 +747,9 @@ class AuctionDatabase {
         }
         if (this.state.universalPurse === undefined) {
           this.state.universalPurse = 800;
+        }
+        if (needsSave) {
+          this.save();
         }
       } catch (e) {
         console.error('Error loading db file, re-initializing', e);
@@ -711,10 +778,14 @@ class AuctionDatabase {
   }
 
   private createDefaultState(): DatabaseState {
+    const defaultAdminCode = getDefaultAdminCode();
+    if (!defaultAdminCode) {
+      console.error('ADMIN_DEFAULT_CODE is not configured; admin login is disabled.');
+    }
     return {
       config: {
         gameCode: 'APL2026',
-        adminCode: 'ADMIN777',
+        ...(defaultAdminCode ? { adminCodeHash: hashAdminCode(defaultAdminCode) } : {}),
       },
       universalPurse: 800,
       teams: getInitialTeams(),
@@ -815,8 +886,31 @@ class AuctionDatabase {
     this.save();
   }
 
+  public updateAdminCode(normalizedNewCode: string) {
+    this.state.config.adminCodeHash = hashAdminCode(normalizedNewCode);
+    if ('adminCode' in this.state.config) {
+      delete this.state.config.adminCode;
+    }
+    this.state.auditLogs.push({
+      id: `admin_code_${Date.now()}`,
+      action: 'ADMIN_CODE_CHANGED',
+      timestamp: new Date().toISOString(),
+      details: { message: 'Admin login code was updated.' },
+    });
+    this.save();
+  }
+
   public clearDatabase() {
-    // Reset all 4 team purses back to $800M and reset names if needed or keep names
+    const defaultAdminCode = getDefaultAdminCode();
+    if (!defaultAdminCode) {
+      throw new Error('Reset unavailable: default admin code configuration is missing.');
+    }
+
+    // Reset all 4 team purses back to $800M, restore default admin code hash, and reset state
+    this.state.config.adminCodeHash = hashAdminCode(defaultAdminCode);
+    if ('adminCode' in this.state.config) {
+      delete this.state.config.adminCode;
+    }
     this.state.universalPurse = 800;
     this.state.teams = getInitialTeams();
     this.state.players = getInitialPlayers();
@@ -1113,35 +1207,773 @@ class AuctionDatabase {
 export const db = new AuctionDatabase();
 
 function publicState() {
-  const { config, ...rest } = db.getState();
-  return rest;
+  const state = db.getState();
+  const auction = state.activeAuction;
+  return {
+    universalPurse: typeof state.universalPurse === 'number' ? state.universalPurse : 800,
+    teams: state.teams.map((t) => ({
+      id: t.id,
+      code: t.code,
+      name: t.name,
+      color: t.color,
+      avatarBg: t.avatarBg,
+      baseBudget: t.baseBudget,
+      adjustedBudget: t.adjustedBudget,
+      remainingBudget: t.remainingBudget,
+      totalSpent: t.totalSpent,
+      totalValue: t.totalValue,
+      isQualified: t.isQualified,
+      loginCode: t.loginCode,
+    })),
+    players: state.players.map((p) => ({
+      id: p.id,
+      name: p.name,
+      role: p.role,
+      type: p.type,
+      teamId: p.teamId,
+      valuePoints: p.valuePoints,
+      basePrice: p.basePrice,
+      soldCost: p.soldCost,
+      isSold: p.isSold,
+      lotNumber: p.lotNumber,
+      lotName: p.lotName,
+      imageUrl: p.imageUrl,
+    })),
+    activeAuction: {
+      playerId: auction.playerId,
+      biddingType: auction.biddingType,
+      currentBid: auction.currentBid,
+      currentTeam: auction.currentTeam,
+      timerSeconds: auction.timerSeconds,
+      timerDuration: auction.timerDuration,
+      timerRunning: auction.timerRunning,
+      status: auction.status,
+      bidHistory: Array.isArray(auction.bidHistory)
+        ? auction.bidHistory.map((item) => ({
+            id: item.id,
+            playerId: item.playerId,
+            teamCode: item.teamCode,
+            amount: item.amount,
+            timestamp: item.timestamp,
+          }))
+        : [],
+      startedAt: auction.startedAt,
+    },
+  };
 }
+
+// --- SESSION & WEBSOCKET SECURITY CONFIGURATION ---
+interface SessionRecord {
+  token: string;
+  role: 'admin' | 'participant';
+  teamCode?: string;
+  teamId?: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+interface ConnectionIpTracking {
+  clientIp: string;
+  countsAsUnauth: boolean;
+  ipReleased: boolean;
+  handedOffToWs: boolean;
+}
+
+interface IpConnectionCounts {
+  total: number;
+  unauth: number;
+}
+
+interface ClientMeta {
+  authenticated: boolean;
+  sessionToken: string | null;
+  role: 'admin' | 'participant' | null;
+  teamCode: string | null;
+  isAlive: boolean;
+  msgTimestamps: number[];
+  rateLimitWarnedAt: number;
+  invalidAttempts: number;
+  authTimer: NodeJS.Timeout | null;
+  ipTracking: ConnectionIpTracking;
+}
+
+const DEFAULT_WS_MAX_CONNECTIONS_PER_IP = 100;
+const DEFAULT_WS_MAX_UNAUTH_CONNECTIONS_PER_IP = 25;
+const MAX_CONFIGURABLE_WS_CONNECTION_LIMIT = 100_000;
+
+function parsePositiveIntLimit(
+  rawValue: string | undefined,
+  defaultValue: number,
+  maxValue = MAX_CONFIGURABLE_WS_CONNECTION_LIMIT
+): number {
+  if (typeof rawValue !== 'string') {
+    return defaultValue;
+  }
+  const trimmed = rawValue.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return defaultValue;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maxValue) {
+    return defaultValue;
+  }
+  return parsed;
+}
+
+const WS_MAX_CONNECTIONS_PER_IP = parsePositiveIntLimit(
+  process.env.WS_MAX_CONNECTIONS_PER_IP,
+  DEFAULT_WS_MAX_CONNECTIONS_PER_IP
+);
+const WS_MAX_UNAUTH_CONNECTIONS_PER_IP = parsePositiveIntLimit(
+  process.env.WS_MAX_UNAUTH_CONNECTIONS_PER_IP,
+  DEFAULT_WS_MAX_UNAUTH_CONNECTIONS_PER_IP
+);
+
+const SESSION_TTL_MS = (() => {
+  const parsed = Number(process.env.SESSION_TTL_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 12 * 60 * 60 * 1000;
+})();
+
+const MAX_WS_PAYLOAD_BYTES = 16 * 1024; // 16 KB
+const AUTH_HANDSHAKE_TIMEOUT_MS = 10_000; // 10 seconds
+const HEARTBEAT_INTERVAL_MS = 30_000; // 30 seconds
+const RATE_LIMIT_WINDOW_MS = 5_000; // 5 seconds
+const RATE_LIMIT_MAX_MESSAGES = 25; // max 25 messages per 5s window
+const MAX_PURSE_AMOUNT = 1_000_000; // 1,000,000 M$ upper bound
+const ALLOWED_AUCTION_DURATIONS = new Set([30, 60, 90, 120]);
+const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+const sessions = new Map<string, SessionRecord>();
+const clientMetaMap = new WeakMap<WebSocket, ClientMeta>();
+const ipConnections = new Map<string, IpConnectionCounts>();
+const pendingUpgradeTickets = new WeakMap<IncomingMessage, ConnectionIpTracking>();
+
+function isTrustProxyEnabled(): boolean {
+  return process.env.TRUST_PROXY === 'true' || process.env.TRUST_PROXY === '1';
+}
+
+function expandIpv6ToGroups(ip: string): number[] | null {
+  let working = ip.toLowerCase();
+  const doubleColonParts = working.split('::');
+  if (doubleColonParts.length > 2) {
+    return null;
+  }
+
+  const parseSegmentList = (segment: string): number[] | null => {
+    if (!segment) return [];
+    const parts = segment.split(':');
+    const groups: number[] = [];
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (part.includes('.')) {
+        if (i !== parts.length - 1 || !net.isIPv4(part)) {
+          return null;
+        }
+        const octets = part.split('.').map(Number);
+        groups.push((octets[0] << 8) | octets[1], (octets[2] << 8) | octets[3]);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/.test(part)) {
+          return null;
+        }
+        groups.push(parseInt(part, 16));
+      }
+    }
+    return groups;
+  };
+
+  if (doubleColonParts.length === 1) {
+    const groups = parseSegmentList(doubleColonParts[0]);
+    return groups && groups.length === 8 ? groups : null;
+  }
+
+  const left = parseSegmentList(doubleColonParts[0]);
+  const right = parseSegmentList(doubleColonParts[1]);
+  if (!left || !right) return null;
+
+  const missingCount = 8 - (left.length + right.length);
+  if (missingCount < 1) return null;
+
+  return [...left, ...new Array<number>(missingCount).fill(0), ...right];
+}
+
+function formatCanonicalIpv6(groups: number[]): string {
+  // Collapse longest run of >= 2 zero groups per RFC 5952
+  let bestStart = -1;
+  let bestLen = 0;
+  let currStart = -1;
+  let currLen = 0;
+
+  for (let i = 0; i < 8; i++) {
+    if (groups[i] === 0) {
+      if (currStart === -1) {
+        currStart = i;
+        currLen = 1;
+      } else {
+        currLen += 1;
+      }
+      if (currLen > bestLen) {
+        bestStart = currStart;
+        bestLen = currLen;
+      }
+    } else {
+      currStart = -1;
+      currLen = 0;
+    }
+  }
+
+  if (bestLen < 2) {
+    bestStart = -1;
+    bestLen = 0;
+  }
+
+  const hexGroups = groups.map((g) => g.toString(16));
+  if (bestStart === -1) {
+    return hexGroups.join(':');
+  }
+
+  const left = hexGroups.slice(0, bestStart).join(':');
+  const right = hexGroups.slice(bestStart + bestLen).join(':');
+  return `${left}::${right}`;
+}
+
+function normalizeIp(rawIp: string | undefined | null): string {
+  if (typeof rawIp !== 'string') {
+    return 'unknown';
+  }
+
+  let candidate = rawIp.trim();
+  if (!candidate) {
+    return 'unknown';
+  }
+
+  // Strip optional brackets (e.g. [::1] or [::1]:12345)
+  const bracketMatch = /^\[([^\]]+)\](?::\d+)?$/.exec(candidate);
+  if (bracketMatch) {
+    candidate = bracketMatch[1];
+  } else {
+    // Strip optional :port from IPv4:port
+    const ipv4PortMatch = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(candidate);
+    if (ipv4PortMatch && net.isIPv4(ipv4PortMatch[1])) {
+      candidate = ipv4PortMatch[1];
+    }
+  }
+
+  // Strip IPv6 zone identifier if present (e.g. fe80::1%eth0)
+  const zoneIdx = candidate.indexOf('%');
+  if (zoneIdx !== -1) {
+    candidate = candidate.slice(0, zoneIdx);
+  }
+
+  candidate = candidate.toLowerCase();
+  const ipVersion = net.isIP(candidate);
+  if (ipVersion === 4) {
+    return candidate;
+  }
+  if (ipVersion === 6) {
+    const groups = expandIpv6ToGroups(candidate);
+    if (!groups) {
+      return candidate;
+    }
+    // Map IPv4-mapped IPv6 addresses (::ffff:a.b.c.d or ::ffff:xxxx:yyyy) to canonical IPv4
+    const isIpv4Mapped =
+      groups[0] === 0 &&
+      groups[1] === 0 &&
+      groups[2] === 0 &&
+      groups[3] === 0 &&
+      groups[4] === 0 &&
+      groups[5] === 0xffff;
+    if (isIpv4Mapped) {
+      return `${(groups[6] >> 8) & 0xff}.${groups[6] & 0xff}.${(groups[7] >> 8) & 0xff}.${groups[7] & 0xff}`;
+    }
+    return formatCanonicalIpv6(groups);
+  }
+
+  return 'unknown';
+}
+
+function getClientIp(req?: IncomingMessage): string {
+  const socketIp = normalizeIp(req?.socket?.remoteAddress);
+  if (!req || !isTrustProxyEnabled()) {
+    return socketIp;
+  }
+
+  const forwardedFor = req.headers['x-forwarded-for'];
+  const rawHeader = Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor;
+  if (typeof rawHeader === 'string' && rawHeader.trim().length > 0) {
+    for (const part of rawHeader.split(',')) {
+      const normalized = normalizeIp(part);
+      if (normalized !== 'unknown') {
+        return normalized;
+      }
+    }
+  }
+
+  return socketIp;
+}
+
+function tryAcquireIpConnectionSlot(clientIp: string): ConnectionIpTracking | null {
+  const current = ipConnections.get(clientIp) || { total: 0, unauth: 0 };
+  if (
+    current.total >= WS_MAX_CONNECTIONS_PER_IP ||
+    current.unauth >= WS_MAX_UNAUTH_CONNECTIONS_PER_IP
+  ) {
+    return null;
+  }
+  current.total += 1;
+  current.unauth += 1;
+  ipConnections.set(clientIp, current);
+  return {
+    clientIp,
+    countsAsUnauth: true,
+    ipReleased: false,
+    handedOffToWs: false,
+  };
+}
+
+function releaseUnauthSlot(tracking: ConnectionIpTracking) {
+  if (tracking.ipReleased || !tracking.countsAsUnauth) {
+    return;
+  }
+  tracking.countsAsUnauth = false;
+  const entry = ipConnections.get(tracking.clientIp);
+  if (!entry) return;
+  entry.unauth = Math.max(0, entry.unauth - 1);
+  if (entry.total === 0 && entry.unauth === 0) {
+    ipConnections.delete(tracking.clientIp);
+  }
+}
+
+function releaseConnectionSlot(tracking: ConnectionIpTracking) {
+  if (tracking.ipReleased) {
+    return;
+  }
+  tracking.ipReleased = true;
+  const wasUnauth = tracking.countsAsUnauth;
+  tracking.countsAsUnauth = false;
+  const entry = ipConnections.get(tracking.clientIp);
+  if (!entry) return;
+  entry.total = Math.max(0, entry.total - 1);
+  if (wasUnauth) {
+    entry.unauth = Math.max(0, entry.unauth - 1);
+  }
+  if (entry.total === 0 && entry.unauth === 0) {
+    ipConnections.delete(tracking.clientIp);
+  }
+}
+
+function createSession(role: 'admin' | 'participant', team?: Team): SessionRecord {
+  const token = crypto.randomBytes(32).toString('hex');
+  const now = Date.now();
+  const record: SessionRecord = {
+    token,
+    role,
+    teamCode: team?.code,
+    teamId: team?.id,
+    createdAt: now,
+    expiresAt: now + SESSION_TTL_MS,
+  };
+  sessions.set(token, record);
+  return record;
+}
+
+function validateSession(token: unknown): SessionRecord | null {
+  if (typeof token !== 'string' || token.length < 32 || token.length > 256) {
+    return null;
+  }
+  const session = sessions.get(token);
+  if (!session) return null;
+  if (Date.now() > session.expiresAt) {
+    sessions.delete(token);
+    return null;
+  }
+  return session;
+}
+
+function parseAllowedOrigins(): Set<string> {
+  const raw = process.env.WS_ALLOWED_ORIGINS || process.env.ALLOWED_ORIGINS || '';
+  const set = new Set<string>();
+  const isProd = process.env.NODE_ENV === 'production';
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = new URL(trimmed);
+      if (trimmed !== parsed.origin || parsed.username || parsed.password) {
+        continue;
+      }
+      if (parsed.protocol !== 'https:' && (isProd || parsed.protocol !== 'http:')) {
+        continue;
+      }
+      set.add(parsed.origin);
+    } catch {
+      // ignore invalid origin entries
+    }
+  }
+  return set;
+}
+
+const LOCAL_DEV_ORIGINS = new Set([
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://0.0.0.0:3000',
+  'https://localhost:3000',
+  'https://127.0.0.1:3000',
+]);
+
+function isLoopbackIp(rawIp: string | undefined | null): boolean {
+  const normalized = normalizeIp(rawIp);
+  return normalized === '127.0.0.1' || normalized === '::1';
+}
+
+function getConfiguredAppOrigin(isProd: boolean): string | null {
+  const rawAppUrl = (process.env.APP_URL || '').trim();
+  if (!rawAppUrl) return null;
+  try {
+    const parsed = new URL(rawAppUrl);
+    if (parsed.username || parsed.password) return null;
+    if (parsed.protocol !== 'https:' && (isProd || parsed.protocol !== 'http:')) {
+      return null;
+    }
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+function stripDefaultPortForProtocol(host: string, protocol: string): string {
+  const lower = host.toLowerCase();
+  if (protocol === 'https:' && lower.endsWith(':443')) {
+    return lower.slice(0, -4);
+  }
+  if (protocol === 'http:' && lower.endsWith(':80')) {
+    return lower.slice(0, -3);
+  }
+  return lower;
+}
+
+function isOriginAllowed(req: IncomingMessage): boolean {
+  const originHeader = req.headers.origin;
+  if (!originHeader || typeof originHeader !== 'string') {
+    return false;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(originHeader);
+  } catch {
+    return false;
+  }
+
+  // Reject malformed origins with paths, query strings, fragments, or userinfo
+  if (originHeader !== parsed.origin || parsed.username || parsed.password) {
+    return false;
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return false;
+  }
+
+  const isProd = process.env.NODE_ENV === 'production';
+
+  // In production, enforce HTTPS BEFORE checking any allowlist or host match
+  if (isProd && parsed.protocol !== 'https:') {
+    return false;
+  }
+
+  const normalizedOrigin = parsed.origin;
+  const rawAllowlist = (process.env.WS_ALLOWED_ORIGINS || process.env.ALLOWED_ORIGINS || '').trim();
+  const explicitAllowedOrigins = parseAllowedOrigins();
+
+  if (rawAllowlist.length > 0) {
+    if (explicitAllowedOrigins.has(normalizedOrigin)) {
+      return true;
+    }
+    if (!isProd && LOCAL_DEV_ORIGINS.has(normalizedOrigin)) {
+      return true;
+    }
+    return false;
+  }
+
+  if (!isProd && LOCAL_DEV_ORIGINS.has(normalizedOrigin)) {
+    return true;
+  }
+
+  const appOrigin = getConfiguredAppOrigin(isProd);
+  if (appOrigin && normalizedOrigin === appOrigin) {
+    return true;
+  }
+
+  const trustProxy = isTrustProxyEnabled() || isLoopbackIp(req.socket?.remoteAddress);
+  const forwardedHost = trustProxy ? req.headers['x-forwarded-host'] : undefined;
+  const rawHostHeader = Array.isArray(forwardedHost)
+    ? forwardedHost[0]
+    : forwardedHost || req.headers.host;
+
+  if (!rawHostHeader || typeof rawHostHeader !== 'string') {
+    return false;
+  }
+
+  const requestHost = stripDefaultPortForProtocol(
+    rawHostHeader.split(',')[0].trim(),
+    parsed.protocol
+  );
+  if (!requestHost || parsed.host.toLowerCase() !== requestHost) {
+    return false;
+  }
+
+  if (trustProxy) {
+    const forwardedProto = req.headers['x-forwarded-proto'];
+    const protoStr = Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto;
+    if (
+      protoStr &&
+      protoStr.split(',')[0].trim().toLowerCase() === 'https' &&
+      parsed.protocol !== 'https:'
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function hasOnlyAllowedKeys(obj: Record<string, unknown>, allowedKeys: readonly string[]): boolean {
+  const allowed = new Set(allowedKeys);
+  for (const key of Object.keys(obj)) {
+    if (FORBIDDEN_KEYS.has(key) || !allowed.has(key)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function findTeamByIdentifier(identifier: string): Team | undefined {
+  const match = identifier.trim().toLowerCase();
+  if (!match) return undefined;
+  return db
+    .getState()
+    .teams.find(
+      (t) =>
+        t.id.toLowerCase() === match ||
+        t.code.toLowerCase() === match ||
+        (t.name && t.name.trim().toLowerCase() === match)
+    );
+}
+
+function sendJson(ws: WebSocket, payload: unknown) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(JSON.stringify(payload));
+  } catch {
+    // ignore send failures on closing sockets
+  }
+}
+
+function cleanupSocket(ws: WebSocket, meta: ClientMeta) {
+  if (meta.authTimer) {
+    clearTimeout(meta.authTimer);
+    meta.authTimer = null;
+  }
+  meta.authenticated = false;
+  meta.sessionToken = null;
+  meta.role = null;
+  meta.teamCode = null;
+  releaseConnectionSlot(meta.ipTracking);
+  try {
+    ws.terminate();
+  } catch {
+    // ignore
+  }
+}
+
+function revokeSocketSession(ws: WebSocket, meta: ClientMeta, reason: string) {
+  if (meta.authTimer) {
+    clearTimeout(meta.authTimer);
+    meta.authTimer = null;
+  }
+  meta.authenticated = false;
+  meta.sessionToken = null;
+  meta.role = null;
+  meta.teamCode = null;
+  sendJson(ws, { type: 'AUTH_ERROR', message: reason });
+  try {
+    ws.close(4001, reason);
+    setTimeout(() => {
+      if (ws.readyState !== WebSocket.CLOSED) {
+        cleanupSocket(ws, meta);
+      }
+    }, 1000).unref();
+  } catch {
+    cleanupSocket(ws, meta);
+  }
+}
+
+const ADMIN_COMMANDS = new Set([
+  'START_BID',
+  'END_BIDDING',
+  'CLOSE_BID_MODAL',
+  'CLEAR_DATABASE',
+  'UPDATE_TEAM_NAME',
+  'UPDATE_TEAM_CODE',
+  'UPDATE_TEAM_PURSE',
+  'UPDATE_ALL_PURSES',
+  'REAUCTION_PLAYER',
+  'EXTEND_TIMER',
+]);
 
 // --- SERVER SETUP ---
 const app = express();
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: MAX_WS_PAYLOAD_BYTES,
+});
 
-app.use(express.json());
+server.on('upgrade', (req, socket, head) => {
+  let pathname = '';
+  try {
+    pathname = new URL(req.url || '/', 'http://localhost').pathname;
+  } catch {
+    pathname = '';
+  }
+
+  // Only handle application WebSocket upgrades on /ws; leave other paths (e.g. Vite HMR /__vite_hmr) untouched in dev
+  if (pathname !== '/ws') {
+    if (process.env.NODE_ENV === 'production') {
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+    }
+    return;
+  }
+
+  if (!isOriginAllowed(req)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  const clientIp = getClientIp(req);
+  const tracking = tryAcquireIpConnectionSlot(clientIp);
+  if (!tracking) {
+    socket.write(
+      'HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\nConnection: close\r\nRetry-After: 5\r\n\r\nToo many WebSocket connections from this IP.\r\n'
+    );
+    socket.destroy();
+    return;
+  }
+
+  pendingUpgradeTickets.set(req, tracking);
+  const releasePendingIfNotHandedOff = () => {
+    if (!tracking.handedOffToWs) {
+      pendingUpgradeTickets.delete(req);
+      releaseConnectionSlot(tracking);
+    }
+  };
+  socket.once('close', releasePendingIfNotHandedOff);
+  socket.once('error', releasePendingIfNotHandedOff);
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    socket.off('close', releasePendingIfNotHandedOff);
+    socket.off('error', releasePendingIfNotHandedOff);
+    if (tracking.ipReleased || socket.destroyed) {
+      pendingUpgradeTickets.delete(req);
+      releaseConnectionSlot(tracking);
+      try {
+        ws.terminate();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    tracking.handedOffToWs = true;
+    wss.emit('connection', ws, req);
+  });
+});
+
+wss.on('error', (err) => {
+  console.error('WebSocketServer error:', err);
+});
+
+app.disable('x-powered-by');
+app.use('/api', express.json({ limit: '16kb', strict: true }));
+
+// Catch malformed JSON / oversized JSON payloads before route handlers without leaking stack traces
+app.use('/api', (err: any, _req: Request, res: Response, next: NextFunction) => {
+  if (!err) return next();
+  if (err.type === 'entity.parse.failed' || err instanceof SyntaxError) {
+    return res.status(400).json({ error: 'Malformed JSON request body.' });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request payload too large.' });
+  }
+  return res.status(400).json({ error: 'Invalid request.' });
+});
 
 // Serve local player photos (works in dev and production, on any domain)
 app.use(
   '/players',
-  express.static(path.join(__dirname, 'public', 'players'), { maxAge: '7d' })
+  express.static(path.join(__dirname, 'public', 'players'), {
+    maxAge: '7d',
+    dotfiles: 'ignore',
+  })
 );
 
-// Broadcast helper for WebSockets
+// Broadcast helper for authenticated WebSockets only
 function broadcast(payload: any) {
   const data = JSON.stringify(payload);
   wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(data);
+    if (client.readyState !== WebSocket.OPEN) return;
+    const meta = clientMetaMap.get(client);
+    if (!meta || !meta.authenticated || !meta.sessionToken) return;
+    if (!validateSession(meta.sessionToken)) {
+      revokeSocketSession(client, meta, 'Session expired. Please log in again.');
+      return;
+    }
+    try {
+      client.send(data, (err) => {
+        if (err) {
+          cleanupSocket(client, meta);
+        }
+      });
+    } catch {
+      cleanupSocket(client, meta);
     }
   });
 }
 
+// Heartbeat & Expired Session Cleanup Loop
+const heartbeatInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of sessions.entries()) {
+    if (now > session.expiresAt) {
+      sessions.delete(token);
+    }
+  }
+
+  wss.clients.forEach((client) => {
+    const meta = clientMetaMap.get(client);
+    if (!meta) return;
+
+    if (meta.authenticated && meta.sessionToken && !validateSession(meta.sessionToken)) {
+      revokeSocketSession(client, meta, 'Session expired. Please log in again.');
+      return;
+    }
+
+    if (!meta.isAlive) {
+      cleanupSocket(client, meta);
+      return;
+    }
+
+    meta.isAlive = false;
+    try {
+      client.ping();
+    } catch {
+      cleanupSocket(client, meta);
+    }
+  });
+}, HEARTBEAT_INTERVAL_MS);
+
 // Timer Loop (runs on server every second)
-setInterval(() => {
+const auctionTimerInterval = setInterval(() => {
   const state = db.getState();
   const auction = state.activeAuction;
 
@@ -1181,35 +2013,310 @@ setInterval(() => {
   }
 }, 1000);
 
-// WebSocket Connections
-wss.on('connection', (ws) => {
-  // Send current full state on connect
-  ws.send(
-    JSON.stringify({
-      type: 'INIT_STATE',
-      state: publicState(),
-    })
-  );
+function clearServerIntervals() {
+  clearInterval(heartbeatInterval);
+  clearInterval(auctionTimerInterval);
+  wss.clients.forEach((client) => {
+    const meta = clientMetaMap.get(client);
+    if (meta) {
+      cleanupSocket(client, meta);
+    }
+  });
+  ipConnections.clear();
+}
 
-  ws.on('message', (message) => {
+wss.on('close', clearServerIntervals);
+server.on('close', clearServerIntervals);
+
+// WebSocket Connections (authenticated handshake required before state or commands)
+wss.on('connection', (ws, req) => {
+  const existingTicket = req ? pendingUpgradeTickets.get(req) : undefined;
+  if (req) {
+    pendingUpgradeTickets.delete(req);
+  }
+  const ipTracking: ConnectionIpTracking = existingTicket || {
+    clientIp: getClientIp(req),
+    countsAsUnauth: true,
+    ipReleased: false,
+    handedOffToWs: true,
+  };
+
+  const meta: ClientMeta = {
+    authenticated: false,
+    sessionToken: null,
+    role: null,
+    teamCode: null,
+    isAlive: true,
+    msgTimestamps: [],
+    rateLimitWarnedAt: 0,
+    invalidAttempts: 0,
+    authTimer: setTimeout(() => {
+      if (!meta.authenticated) {
+        revokeSocketSession(ws, meta, 'Authentication timeout. Please log in again.');
+      }
+    }, AUTH_HANDSHAKE_TIMEOUT_MS),
+    ipTracking,
+  };
+  clientMetaMap.set(ws, meta);
+
+  ws.on('pong', () => {
+    meta.isAlive = true;
+  });
+
+  ws.on('close', () => {
+    if (meta.authTimer) {
+      clearTimeout(meta.authTimer);
+      meta.authTimer = null;
+    }
+    meta.authenticated = false;
+    meta.sessionToken = null;
+    meta.role = null;
+    meta.teamCode = null;
+    releaseConnectionSlot(meta.ipTracking);
+  });
+
+  ws.on('error', () => {
+    cleanupSocket(ws, meta);
+  });
+
+  ws.on('message', (message, isBinary) => {
     try {
-      const data = JSON.parse(message.toString());
+      if (isBinary) {
+        sendJson(ws, { type: 'ERROR', message: 'Binary messages are not supported.' });
+        if (!meta.authenticated) {
+          meta.invalidAttempts += 1;
+          if (meta.invalidAttempts >= 3) {
+            ws.close(4001, 'Authentication required');
+          }
+        }
+        return;
+      }
 
+      // Per-connection sliding window rate limiting
+      const now = Date.now();
+      meta.msgTimestamps = meta.msgTimestamps.filter(
+        (ts) => now - ts < RATE_LIMIT_WINDOW_MS
+      );
+      if (meta.msgTimestamps.length >= RATE_LIMIT_MAX_MESSAGES) {
+        if (now - meta.rateLimitWarnedAt > 1000) {
+          meta.rateLimitWarnedAt = now;
+          sendJson(ws, { type: 'ERROR', message: 'Rate limit exceeded. Please slow down.' });
+        }
+        if (meta.msgTimestamps.length >= RATE_LIMIT_MAX_MESSAGES * 2) {
+          ws.close(1008, 'Rate limit exceeded');
+        }
+        meta.msgTimestamps.push(now);
+        return;
+      }
+      meta.msgTimestamps.push(now);
+
+      let data: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(message.toString('utf8'));
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          sendJson(ws, { type: 'ERROR', message: 'Malformed message payload.' });
+          if (!meta.authenticated) {
+            meta.invalidAttempts += 1;
+            if (meta.invalidAttempts >= 3) ws.close(4001, 'Authentication required');
+          }
+          return;
+        }
+        data = parsed as Record<string, unknown>;
+      } catch {
+        sendJson(ws, { type: 'ERROR', message: 'Invalid JSON payload.' });
+        if (!meta.authenticated) {
+          meta.invalidAttempts += 1;
+          if (meta.invalidAttempts >= 3) ws.close(4001, 'Authentication required');
+        }
+        return;
+      }
+
+      if (typeof data.type !== 'string' || !data.type || data.type.length > 64) {
+        sendJson(ws, { type: 'ERROR', message: 'Invalid or missing message type.' });
+        if (!meta.authenticated) {
+          meta.invalidAttempts += 1;
+          if (meta.invalidAttempts >= 3) ws.close(4001, 'Authentication required');
+        }
+        return;
+      }
+
+      // 1. Authentication Handshake
+      if (data.type === 'AUTH') {
+        if (!hasOnlyAllowedKeys(data, ['type', 'token'])) {
+          sendJson(ws, { type: 'AUTH_ERROR', message: 'Unexpected fields in AUTH payload.' });
+          return;
+        }
+        if (meta.authenticated) {
+          sendJson(ws, {
+            type: 'ERROR',
+            message: 'Connection is already authenticated. Open a new connection to change sessions.',
+          });
+          return;
+        }
+
+        const session = validateSession(data.token);
+        if (!session) {
+          meta.authenticated = false;
+          meta.sessionToken = null;
+          meta.role = null;
+          meta.teamCode = null;
+          meta.invalidAttempts += 1;
+          sendJson(ws, {
+            type: 'AUTH_ERROR',
+            message: 'Invalid or expired session token. Please log in again.',
+          });
+          if (meta.invalidAttempts >= 3) {
+            ws.close(4003, 'Authentication failed');
+          }
+          return;
+        }
+
+        if (meta.authTimer) {
+          clearTimeout(meta.authTimer);
+          meta.authTimer = null;
+        }
+        meta.authenticated = true;
+        meta.sessionToken = session.token;
+        meta.role = session.role;
+        meta.teamCode = session.teamCode || null;
+        meta.invalidAttempts = 0;
+        releaseUnauthSlot(meta.ipTracking);
+
+        sendJson(ws, {
+          type: 'AUTH_OK',
+          role: session.role,
+          selectedTeam: session.teamCode,
+        });
+        sendJson(ws, {
+          type: 'INIT_STATE',
+          state: publicState(),
+        });
+        return;
+      }
+
+      // 2. Reject any unauthenticated connection commands
+      if (!meta.authenticated || !meta.sessionToken) {
+        meta.invalidAttempts += 1;
+        sendJson(ws, { type: 'ERROR', message: 'Authentication required.' });
+        if (meta.invalidAttempts >= 3) {
+          ws.close(4001, 'Authentication required');
+        }
+        return;
+      }
+
+      const session = validateSession(meta.sessionToken);
+      if (!session || session.role !== meta.role || (session.teamCode || null) !== meta.teamCode) {
+        revokeSocketSession(ws, meta, 'Session expired. Please log in again.');
+        return;
+      }
+
+      if (data.type === 'LOGOUT') {
+        if (!hasOnlyAllowedKeys(data, ['type'])) {
+          sendJson(ws, { type: 'ERROR', message: 'Unexpected fields in LOGOUT payload.' });
+          return;
+        }
+        sessions.delete(session.token);
+        meta.authenticated = false;
+        meta.sessionToken = null;
+        meta.role = null;
+        meta.teamCode = null;
+        ws.close(1000, 'Logged out');
+        return;
+      }
+
+      // 3. Enforce Role-Based Authorization
+      if (ADMIN_COMMANDS.has(data.type) && session.role !== 'admin') {
+        sendJson(ws, { type: 'ERROR', message: 'Unauthorized: Admin privileges required.' });
+        return;
+      }
+
+      // 4. Validate Payload Schemas & Execute Authorized Commands
       if (data.type === 'PLACE_BID') {
-        const { teamCode, amount } = data;
-        const result = db.placeBid(teamCode, Number(amount));
+        if (!hasOnlyAllowedKeys(data, ['type', 'teamCode', 'amount'])) {
+          sendJson(ws, { type: 'ERROR', message: 'Unexpected fields in PLACE_BID payload.' });
+          return;
+        }
+        if (session.role !== 'participant' || !session.teamCode) {
+          sendJson(ws, {
+            type: 'ERROR',
+            message: 'Only authenticated team participants can place bids.',
+          });
+          return;
+        }
+        if (data.teamCode !== undefined) {
+          if (
+            typeof data.teamCode !== 'string' ||
+            data.teamCode.trim().toLowerCase() !== session.teamCode.toLowerCase()
+          ) {
+            sendJson(ws, {
+              type: 'ERROR',
+              message: 'Unauthorized: Cannot bid on behalf of another team.',
+            });
+            return;
+          }
+        }
+        if (
+          typeof data.amount !== 'number' ||
+          !Number.isFinite(data.amount) ||
+          data.amount <= 0 ||
+          data.amount > MAX_PURSE_AMOUNT
+        ) {
+          sendJson(ws, { type: 'ERROR', message: 'Invalid bid amount.' });
+          return;
+        }
+
+        const result = db.placeBid(session.teamCode, data.amount);
         broadcast({
           type: 'BID_PLACED',
           auction: result.auction,
           state: publicState(),
-          message: `${teamCode} placed a bid of ${amount} M$!`,
+          message: `${session.teamCode} placed a bid of ${data.amount} M$!`,
         });
       } else if (data.type === 'START_BID') {
-        const { playerId, durationSeconds, biddingType } = data;
-        const mode = biddingType === 'offline' ? 'offline' : 'online';
+        if (!hasOnlyAllowedKeys(data, ['type', 'playerId', 'durationSeconds', 'biddingType'])) {
+          sendJson(ws, { type: 'ERROR', message: 'Unexpected fields in START_BID payload.' });
+          return;
+        }
+        if (
+          typeof data.playerId !== 'number' ||
+          !Number.isInteger(data.playerId) ||
+          data.playerId <= 0
+        ) {
+          sendJson(ws, { type: 'ERROR', message: 'Invalid playerId.' });
+          return;
+        }
+        const targetPlayer = db
+          .getState()
+          .players.find((p) => p.id === data.playerId && p.type === 'Auction');
+        if (!targetPlayer) {
+          sendJson(ws, { type: 'ERROR', message: 'Auction player not found.' });
+          return;
+        }
+        if (
+          data.durationSeconds !== undefined &&
+          (typeof data.durationSeconds !== 'number' ||
+            !Number.isInteger(data.durationSeconds) ||
+            !ALLOWED_AUCTION_DURATIONS.has(data.durationSeconds))
+        ) {
+          sendJson(ws, {
+            type: 'ERROR',
+            message: 'Invalid durationSeconds. Allowed values: 30, 60, 90, 120.',
+          });
+          return;
+        }
+        if (
+          data.biddingType !== undefined &&
+          data.biddingType !== 'online' &&
+          data.biddingType !== 'offline'
+        ) {
+          sendJson(ws, { type: 'ERROR', message: 'Invalid biddingType.' });
+          return;
+        }
+
+        const mode = data.biddingType === 'offline' ? 'offline' : 'online';
         const auction = db.startBid(
-          Number(playerId),
-          durationSeconds ? Number(durationSeconds) : 30,
+          targetPlayer.id,
+          data.durationSeconds !== undefined ? data.durationSeconds : 30,
           mode
         );
         broadcast({
@@ -1218,10 +2325,48 @@ wss.on('connection', (ws) => {
           state: publicState(),
         });
       } else if (data.type === 'END_BIDDING') {
-        const offlineAward =
-          data.teamId !== undefined || data.amount !== undefined
-            ? { teamId: data.teamId, amount: data.amount }
-            : undefined;
+        if (!hasOnlyAllowedKeys(data, ['type', 'teamId', 'amount'])) {
+          sendJson(ws, { type: 'ERROR', message: 'Unexpected fields in END_BIDDING payload.' });
+          return;
+        }
+
+        const hasTeamId = data.teamId !== undefined;
+        const hasAmount = data.amount !== undefined;
+        if (hasTeamId !== hasAmount) {
+          sendJson(ws, {
+            type: 'ERROR',
+            message: 'Both teamId and amount must be provided together when awarding offline.',
+          });
+          return;
+        }
+
+        let offlineAward: { teamId: string; amount: number } | undefined;
+        if (hasTeamId && hasAmount) {
+          if (
+            typeof data.teamId !== 'string' ||
+            !data.teamId.trim() ||
+            data.teamId.length > 64
+          ) {
+            sendJson(ws, { type: 'ERROR', message: 'Invalid teamId.' });
+            return;
+          }
+          const matchedTeam = findTeamByIdentifier(data.teamId);
+          if (!matchedTeam) {
+            sendJson(ws, { type: 'ERROR', message: 'Selected team not found.' });
+            return;
+          }
+          if (
+            typeof data.amount !== 'number' ||
+            !Number.isFinite(data.amount) ||
+            data.amount <= 0 ||
+            data.amount > MAX_PURSE_AMOUNT
+          ) {
+            sendJson(ws, { type: 'ERROR', message: 'Invalid offline award amount.' });
+            return;
+          }
+          offlineAward = { teamId: matchedTeam.id, amount: data.amount };
+        }
+
         const result = db.endBidding(offlineAward);
         broadcast({
           type: 'AUCTION_RESOLVED',
@@ -1230,98 +2375,421 @@ wss.on('connection', (ws) => {
           state: publicState(),
         });
       } else if (data.type === 'CLOSE_BID_MODAL') {
+        if (!hasOnlyAllowedKeys(data, ['type'])) {
+          sendJson(ws, { type: 'ERROR', message: 'Unexpected fields in CLOSE_BID_MODAL payload.' });
+          return;
+        }
         db.closeBiddingModal();
         broadcast({
           type: 'STATE_UPDATE',
           state: publicState(),
         });
       } else if (data.type === 'CLEAR_DATABASE') {
+        if (!hasOnlyAllowedKeys(data, ['type'])) {
+          sendJson(ws, { type: 'ERROR', message: 'Unexpected fields in CLEAR_DATABASE payload.' });
+          return;
+        }
         db.clearDatabase();
         broadcast({
           type: 'DATABASE_CLEARED',
           state: publicState(),
         });
       } else if (data.type === 'UPDATE_TEAM_NAME') {
-        db.updateTeamName(data.teamId, data.name);
+        if (!hasOnlyAllowedKeys(data, ['type', 'teamId', 'name'])) {
+          sendJson(ws, { type: 'ERROR', message: 'Unexpected fields in UPDATE_TEAM_NAME payload.' });
+          return;
+        }
+        if (
+          typeof data.teamId !== 'string' ||
+          !data.teamId.trim() ||
+          data.teamId.length > 64 ||
+          typeof data.name !== 'string' ||
+          data.name.length > 64 ||
+          /[\x00-\x1F\x7F]/.test(data.name)
+        ) {
+          sendJson(ws, { type: 'ERROR', message: 'Invalid team name payload.' });
+          return;
+        }
+        const matchedTeam = findTeamByIdentifier(data.teamId);
+        if (!matchedTeam) {
+          sendJson(ws, { type: 'ERROR', message: 'Team not found.' });
+          return;
+        }
+        db.updateTeamName(matchedTeam.id, data.name);
         broadcast({
           type: 'STATE_UPDATE',
           state: publicState(),
         });
       } else if (data.type === 'UPDATE_TEAM_CODE') {
-        db.updateTeamCode(data.teamId, data.code);
+        if (!hasOnlyAllowedKeys(data, ['type', 'teamId', 'code'])) {
+          sendJson(ws, { type: 'ERROR', message: 'Unexpected fields in UPDATE_TEAM_CODE payload.' });
+          return;
+        }
+        if (
+          typeof data.teamId !== 'string' ||
+          !data.teamId.trim() ||
+          data.teamId.length > 64 ||
+          typeof data.code !== 'string'
+        ) {
+          sendJson(ws, { type: 'ERROR', message: 'Invalid team code payload.' });
+          return;
+        }
+        const trimmedCode = data.code.trim().toUpperCase();
+        if (
+          trimmedCode.length < 2 ||
+          trimmedCode.length > 32 ||
+          /[\x00-\x1F\x7F\s]/.test(trimmedCode)
+        ) {
+          sendJson(ws, {
+            type: 'ERROR',
+            message: 'Team code must be 2-32 non-whitespace characters.',
+          });
+          return;
+        }
+        const matchedTeam = findTeamByIdentifier(data.teamId);
+        if (!matchedTeam) {
+          sendJson(ws, { type: 'ERROR', message: 'Team not found.' });
+          return;
+        }
+        const duplicateTeam = db
+          .getState()
+          .teams.find(
+            (t) =>
+              t.id !== matchedTeam.id &&
+              t.loginCode &&
+              t.loginCode.trim().toUpperCase() === trimmedCode
+          );
+        if (duplicateTeam) {
+          sendJson(ws, {
+            type: 'ERROR',
+            message: 'Team login code is already assigned to another team.',
+          });
+          return;
+        }
+        db.updateTeamCode(matchedTeam.id, trimmedCode);
         broadcast({
           type: 'STATE_UPDATE',
           state: publicState(),
         });
       } else if (data.type === 'UPDATE_TEAM_PURSE') {
-        db.updateTeamPurse(data.teamId, Number(data.newPurse));
+        if (!hasOnlyAllowedKeys(data, ['type', 'teamId', 'newPurse'])) {
+          sendJson(ws, {
+            type: 'ERROR',
+            message: 'Unexpected fields in UPDATE_TEAM_PURSE payload.',
+          });
+          return;
+        }
+        if (
+          typeof data.teamId !== 'string' ||
+          !data.teamId.trim() ||
+          data.teamId.length > 64 ||
+          typeof data.newPurse !== 'number' ||
+          !Number.isFinite(data.newPurse) ||
+          data.newPurse < 0 ||
+          data.newPurse > MAX_PURSE_AMOUNT
+        ) {
+          sendJson(ws, { type: 'ERROR', message: 'Invalid team purse payload.' });
+          return;
+        }
+        const matchedTeam = findTeamByIdentifier(data.teamId);
+        if (!matchedTeam) {
+          sendJson(ws, { type: 'ERROR', message: 'Team not found.' });
+          return;
+        }
+        db.updateTeamPurse(matchedTeam.id, data.newPurse);
         broadcast({
           type: 'STATE_UPDATE',
           state: publicState(),
         });
       } else if (data.type === 'UPDATE_ALL_PURSES') {
-        db.updateAllTeamsPurse(Number(data.newPurse));
+        if (!hasOnlyAllowedKeys(data, ['type', 'newPurse'])) {
+          sendJson(ws, {
+            type: 'ERROR',
+            message: 'Unexpected fields in UPDATE_ALL_PURSES payload.',
+          });
+          return;
+        }
+        if (
+          typeof data.newPurse !== 'number' ||
+          !Number.isFinite(data.newPurse) ||
+          data.newPurse < 0 ||
+          data.newPurse > MAX_PURSE_AMOUNT
+        ) {
+          sendJson(ws, { type: 'ERROR', message: 'Invalid universal purse payload.' });
+          return;
+        }
+        db.updateAllTeamsPurse(data.newPurse);
         broadcast({
           type: 'STATE_UPDATE',
           state: publicState(),
         });
       } else if (data.type === 'REAUCTION_PLAYER') {
-        db.reAuctionPlayer(Number(data.playerId));
+        if (!hasOnlyAllowedKeys(data, ['type', 'playerId'])) {
+          sendJson(ws, {
+            type: 'ERROR',
+            message: 'Unexpected fields in REAUCTION_PLAYER payload.',
+          });
+          return;
+        }
+        if (
+          typeof data.playerId !== 'number' ||
+          !Number.isInteger(data.playerId) ||
+          data.playerId <= 0
+        ) {
+          sendJson(ws, { type: 'ERROR', message: 'Invalid playerId.' });
+          return;
+        }
+        const targetPlayer = db
+          .getState()
+          .players.find((p) => p.id === data.playerId && p.type === 'Auction');
+        if (!targetPlayer) {
+          sendJson(ws, { type: 'ERROR', message: 'Auction player not found.' });
+          return;
+        }
+        db.reAuctionPlayer(targetPlayer.id);
         broadcast({
           type: 'STATE_UPDATE',
           state: publicState(),
         });
       } else if (data.type === 'EXTEND_TIMER') {
+        if (!hasOnlyAllowedKeys(data, ['type'])) {
+          sendJson(ws, { type: 'ERROR', message: 'Unexpected fields in EXTEND_TIMER payload.' });
+          return;
+        }
         const timerSeconds = db.extendTimer(30);
         broadcast({
           type: 'TIMER_TICK',
           timerSeconds,
         });
+      } else {
+        sendJson(ws, { type: 'ERROR', message: 'Unsupported message type.' });
       }
     } catch (err: any) {
-      ws.send(
-        JSON.stringify({
-          type: 'ERROR',
-          message: err.message || 'Operation failed',
-        })
-      );
+      sendJson(ws, {
+        type: 'ERROR',
+        message: err.message || 'Operation failed',
+      });
     }
   });
 });
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function timingSafeCodeEqual(a: string, b: string): boolean {
+  const digestA = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const digestB = crypto.createHash('sha256').update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(digestA, digestB);
+}
+
 // REST API Endpoints
-app.get('/api/state', (req, res) => {
+app.get('/api/state', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   res.json(publicState());
 });
 
 app.post('/api/auth/login', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+
+  if (!req.is('application/json')) {
+    return res.status(415).json({ error: 'Content-Type must be application/json.' });
+  }
+
+  if (!isPlainObject(req.body)) {
+    return res.status(400).json({ error: 'Request body must be a JSON object.' });
+  }
+
+  if (!hasOnlyAllowedKeys(req.body, ['teamCode', 'adminCode'])) {
+    return res.status(400).json({ error: 'Unexpected fields in login request.' });
+  }
+
   const { teamCode, adminCode } = req.body;
+  if (adminCode !== undefined && teamCode !== undefined) {
+    return res.status(400).json({ error: 'Provide either teamCode or adminCode, not both.' });
+  }
+
   const config = db.getState().config;
 
   if (adminCode !== undefined) {
-    const cleaned = (adminCode || '').trim().toUpperCase();
-    if (cleaned === config.adminCode) {
-      return res.json({ role: 'admin', gameCode: config.gameCode });
+    if (typeof adminCode !== 'string' || adminCode.length > 64) {
+      return res.status(400).json({ error: 'Invalid Admin Code format.' });
+    }
+    const cleaned = adminCode.trim().toUpperCase();
+    if (!cleaned) {
+      return res.status(400).json({ error: 'Invalid Admin Code format.' });
+    }
+    if (verifyAdminCodeHash(cleaned, config.adminCodeHash)) {
+      const session = createSession('admin');
+      return res.json({
+        role: 'admin',
+        gameCode: config.gameCode,
+        sessionToken: session.token,
+        expiresAt: session.expiresAt,
+      });
     }
     return res.status(401).json({ error: 'Invalid Admin Code. Access denied.' });
   }
 
   if (teamCode !== undefined) {
-    const code = (teamCode || '').trim().toUpperCase();
+    if (typeof teamCode !== 'string' || teamCode.length > 64) {
+      return res.status(400).json({ error: 'Invalid Team Code format.' });
+    }
+    const code = teamCode.trim().toUpperCase();
+    if (!code) {
+      return res.status(400).json({ error: 'Invalid Team Code format.' });
+    }
     const matchedTeam = db
       .getState()
       .teams.find((t) => t.loginCode && t.loginCode.trim().toUpperCase() === code);
     if (matchedTeam) {
+      const session = createSession('participant', matchedTeam);
       return res.json({
         role: 'participant',
         selectedTeam: matchedTeam.code,
         gameCode: config.gameCode,
+        sessionToken: session.token,
+        expiresAt: session.expiresAt,
       });
     }
     return res.status(401).json({ error: 'Invalid Team Code. Please check and try again.' });
   }
 
   return res.status(400).json({ error: 'Please enter a valid Team Code or Admin Code.' });
+});
+
+app.post('/api/auth/change-admin-code', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+
+  if (!req.is('application/json')) {
+    return res.status(415).json({ error: 'Content-Type must be application/json.' });
+  }
+
+  if (!isPlainObject(req.body)) {
+    return res.status(400).json({ error: 'Request body must be a JSON object.' });
+  }
+
+  if (!hasOnlyAllowedKeys(req.body, ['password', 'newAdminCode'])) {
+    return res.status(400).json({ error: 'Unexpected fields in request.' });
+  }
+
+  const expectedPassword = getAdminCodeChangePassword();
+  if (!expectedPassword) {
+    return res.status(503).json({
+      error: 'Admin code change is currently unavailable because server authorization is not configured.',
+    });
+  }
+
+  const { password, newAdminCode } = req.body;
+
+  if (typeof password !== 'string' || password.length === 0 || password.length > 128) {
+    return res.status(400).json({ error: 'Please enter a valid authorization password.' });
+  }
+
+  if (typeof newAdminCode !== 'string' || newAdminCode.length > 64) {
+    return res.status(400).json({ error: 'New Admin Code must be 4-64 non-whitespace characters.' });
+  }
+
+  const normalizedNewCode = newAdminCode.trim().toUpperCase();
+  if (
+    normalizedNewCode.length < 4 ||
+    normalizedNewCode.length > 64 ||
+    /[\x00-\x1F\x7F\s]/.test(normalizedNewCode)
+  ) {
+    return res.status(400).json({
+      error: 'New Admin Code must be 4-64 characters with no spaces or control characters.',
+    });
+  }
+
+  if (!timingSafeCodeEqual(password, expectedPassword)) {
+    return res.status(401).json({ error: 'Incorrect password. Admin code was not changed.' });
+  }
+
+  db.updateAdminCode(normalizedNewCode);
+  return res.json({
+    ok: true,
+    message: 'Admin code updated successfully. Please log in with your new Admin Code.',
+  });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+
+  const authHeader = req.headers.authorization;
+  let bearerToken: string | null = null;
+  if (typeof authHeader === 'string') {
+    const match = /^Bearer\s+(\S+)$/i.exec(authHeader.trim());
+    if (match && match[1].length <= 256) {
+      bearerToken = match[1];
+    }
+  }
+
+  let bodyToken: string | null = null;
+  const contentType = req.headers['content-type'];
+  if (req.body !== undefined) {
+    // express.json leaves req.body as {} only when JSON {} was parsed or untouched
+    if (contentType && !req.is('application/json')) {
+      return res.status(415).json({ error: 'Content-Type must be application/json.' });
+    }
+    if (!isPlainObject(req.body)) {
+      return res.status(400).json({ error: 'Request body must be a JSON object.' });
+    }
+    if (!hasOnlyAllowedKeys(req.body, ['sessionToken'])) {
+      return res.status(400).json({ error: 'Unexpected fields in logout request.' });
+    }
+    if (req.body.sessionToken !== undefined) {
+      if (
+        typeof req.body.sessionToken !== 'string' ||
+        req.body.sessionToken.trim().length === 0 ||
+        req.body.sessionToken.length > 256
+      ) {
+        return res.status(400).json({ error: 'Invalid sessionToken format.' });
+      }
+      bodyToken = req.body.sessionToken.trim();
+    }
+  } else if (contentType && !req.is('application/json')) {
+    return res.status(415).json({ error: 'Content-Type must be application/json.' });
+  }
+
+  if (bearerToken && bodyToken && bearerToken !== bodyToken) {
+    return res.status(400).json({ error: 'Conflicting session tokens in request.' });
+  }
+
+  const token = bearerToken || bodyToken;
+  if (token && token.length >= 32 && token.length <= 256) {
+    sessions.delete(token);
+    wss.clients.forEach((client) => {
+      const meta = clientMetaMap.get(client);
+      if (meta && meta.sessionToken === token) {
+        revokeSocketSession(client, meta, 'Logged out.');
+      }
+    });
+  }
+  return res.json({ ok: true });
+});
+
+// Return clean JSON 404 for unknown /api routes instead of falling through to SPA HTML
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'API endpoint not found.' });
+});
+
+// Final fallback API error handler (prevents leaking stack traces or internals)
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    return next(err);
+  }
+  console.error('Unhandled server error:', err);
+  if (req.path.startsWith('/api')) {
+    return res.status(500).json({ error: 'Internal server error.' });
+  }
+  return res.status(500).send('Internal server error.');
 });
 
 // Vite middleware in dev or static files in production
@@ -1331,7 +2799,13 @@ async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        ws: {
+          server,
+          path: '/__vite_hmr',
+        },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);

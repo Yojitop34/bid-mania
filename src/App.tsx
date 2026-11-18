@@ -18,6 +18,9 @@ export default function App() {
       const saved = sessionStorage.getItem('apl_auth');
       if (saved) {
         const parsed = JSON.parse(saved);
+        if (!parsed?.sessionToken || typeof parsed.sessionToken !== 'string') {
+          return null;
+        }
         if (parsed.role === 'participant' && !parsed.selectedTeam) {
           parsed.selectedTeam = 'Team A';
         }
@@ -36,12 +39,16 @@ export default function App() {
   const [isArenaActive, setIsArenaActive] = useState<boolean>(false);
   const [showLoginModal, setShowLoginModal] = useState<boolean>(() => {
     try {
-      return !sessionStorage.getItem('apl_auth');
+      const saved = sessionStorage.getItem('apl_auth');
+      if (!saved) return true;
+      const parsed = JSON.parse(saved);
+      return !parsed?.sessionToken;
     } catch {
       return true;
     }
   });
   const [auctionError, setAuctionError] = useState<string | null>(null);
+  const [isStartingBid, setIsStartingBid] = useState<boolean>(false);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
     try {
       return localStorage.getItem('apl_sound') !== 'false';
@@ -63,27 +70,70 @@ export default function App() {
   };
 
   const wsRef = useRef<WebSocket | null>(null);
+  const wsAuthenticatedRef = useRef<boolean>(false);
+  const isStartingBidRef = useRef<boolean>(false);
+  const startBidTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Initialize WebSocket connection
+  const clearPendingStartBid = () => {
+    isStartingBidRef.current = false;
+    setIsStartingBid(false);
+    if (startBidTimeoutRef.current) {
+      clearTimeout(startBidTimeoutRef.current);
+      startBidTimeoutRef.current = null;
+    }
+  };
+
+  // Initial state fetch via REST
   useEffect(() => {
+    fetch('/api/state')
+      .then((res) => res.json())
+      .then((data) => {
+        setDbState(data);
+        if (data.activeAuction?.status === 'bidding') {
+          setIsArenaActive(true);
+        }
+      })
+      .catch((err) => console.error('Failed to fetch initial state', err));
+  }, []);
+
+  // Initialize authenticated WebSocket connection whenever sessionToken changes
+  useEffect(() => {
+    const sessionToken = auth?.sessionToken;
+    if (!sessionToken) {
+      wsAuthenticatedRef.current = false;
+      setIsConnected(false);
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      return;
+    }
+
     let isDisposed = false;
     let reconnectTimeout: any;
 
     const connectWebSocket = () => {
       if (isDisposed) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}`;
+      const wsUrl = `${protocol}//${window.location.host}/ws`;
 
+      wsAuthenticatedRef.current = false;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
         if (!isDisposed) {
-          setIsConnected(true);
+          wsAuthenticatedRef.current = false;
+          ws.send(JSON.stringify({ type: 'AUTH', token: sessionToken }));
         }
       };
 
       ws.onclose = () => {
+        wsAuthenticatedRef.current = false;
+        if (isStartingBidRef.current) {
+          clearPendingStartBid();
+          setAuctionError('Live connection was interrupted before bidding started. Please try again.');
+        }
         if (!isDisposed) {
           setIsConnected(false);
           reconnectTimeout = setTimeout(connectWebSocket, 2000);
@@ -98,17 +148,52 @@ export default function App() {
         try {
           const data = JSON.parse(event.data);
 
+          if (data.type === 'AUTH_OK') {
+            wsAuthenticatedRef.current = true;
+            setIsConnected(true);
+            setAuctionError(null);
+            return;
+          }
+
+          if (data.type === 'AUTH_ERROR') {
+            isDisposed = true;
+            clearTimeout(reconnectTimeout);
+            wsAuthenticatedRef.current = false;
+            setIsConnected(false);
+            clearPendingStartBid();
+            setAuctionError(data.message || 'Session expired. Please log in again.');
+            setAuth(null);
+            try {
+              sessionStorage.removeItem('apl_auth');
+              localStorage.removeItem('apl_auth');
+            } catch {
+              // ignore
+            }
+            setShowLoginModal(true);
+            return;
+          }
+
+          // Reject/ignore any application messages before WebSocket authentication succeeds
+          if (!wsAuthenticatedRef.current) {
+            return;
+          }
+
           if (
             data.type === 'INIT_STATE' ||
             data.type === 'STATE_UPDATE' ||
             data.type === 'DATABASE_CLEARED'
           ) {
             setDbState(data.state);
-            if (data.state.activeAuction.status === 'bidding') {
+            if (data.state?.activeAuction?.status === 'bidding') {
+              clearPendingStartBid();
+              setSelectedPlayer(null);
               setIsArenaActive(true);
+              setAuctionError(null);
             }
           } else if (data.type === 'AUCTION_STARTED') {
+            clearPendingStartBid();
             setDbState(data.state);
+            setSelectedPlayer(null);
             setIsArenaActive(true); // Automatically take everyone to the Bidding Arena!
             setAuctionError(null);
           } else if (data.type === 'BID_PLACED') {
@@ -128,7 +213,8 @@ export default function App() {
           } else if (data.type === 'AUCTION_RESOLVED') {
             setDbState(data.state);
           } else if (data.type === 'ERROR') {
-            setAuctionError(data.message);
+            clearPendingStartBid();
+            setAuctionError(data.message || 'Operation failed.');
           }
         } catch (e) {
           console.error('Error handling WebSocket message', e);
@@ -138,34 +224,54 @@ export default function App() {
 
     connectWebSocket();
 
-    // Initial state fetch via REST
-    fetch('/api/state')
-      .then((res) => res.json())
-      .then((data) => {
-        setDbState(data);
-        if (data.activeAuction?.status === 'bidding') {
-          setIsArenaActive(true);
-        }
-      })
-      .catch((err) => console.error('Failed to fetch initial state', err));
-
     return () => {
       isDisposed = true;
+      wsAuthenticatedRef.current = false;
       clearTimeout(reconnectTimeout);
       if (wsRef.current) {
         wsRef.current.close();
+        wsRef.current = null;
       }
     };
-  }, []);
+  }, [auth?.sessionToken]);
 
   const sendWs = (payload: any) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(payload));
+    if (
+      wsRef.current &&
+      wsRef.current.readyState === WebSocket.OPEN &&
+      wsAuthenticatedRef.current
+    ) {
+      try {
+        wsRef.current.send(JSON.stringify(payload));
+        return true;
+      } catch {
+        setAuctionError('Failed to send command over live session. Please try again.');
+        return false;
+      }
     }
+    setAuctionError('Connecting and authenticating live session. Please try again in a moment.');
+    return false;
+  };
+
+  const revokeServerSession = (token?: string) => {
+    if (!token) return;
+    fetch('/api/auth/logout', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ sessionToken: token }),
+      keepalive: true,
+    }).catch(() => {});
   };
 
   const handleLoginSuccess = (newAuth: UserAuth) => {
+    if (auth?.sessionToken && auth.sessionToken !== newAuth.sessionToken) {
+      revokeServerSession(auth.sessionToken);
+    }
     setAuth(newAuth);
+    setAuctionError(null);
     try {
       sessionStorage.setItem('apl_auth', JSON.stringify(newAuth));
       localStorage.setItem('apl_auth', JSON.stringify(newAuth));
@@ -176,6 +282,18 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    clearPendingStartBid();
+    const token = auth?.sessionToken;
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && wsAuthenticatedRef.current) {
+      try {
+        wsRef.current.send(JSON.stringify({ type: 'LOGOUT' }));
+      } catch {
+        // ignore
+      }
+    }
+    revokeServerSession(token);
+    wsAuthenticatedRef.current = false;
+    setIsConnected(false);
     setAuth(null);
     try {
       sessionStorage.removeItem('apl_auth');
@@ -190,10 +308,23 @@ export default function App() {
     playerId: number,
     durationSeconds: number = 30,
     biddingType: 'online' | 'offline' = 'online'
-  ) => {
+  ): boolean => {
     setAuctionError(null);
-    sendWs({ type: 'START_BID', playerId, durationSeconds, biddingType });
-    setIsArenaActive(true);
+    if (!sendWs({ type: 'START_BID', playerId, durationSeconds, biddingType })) {
+      clearPendingStartBid();
+      return false;
+    }
+
+    clearPendingStartBid();
+    isStartingBidRef.current = true;
+    setIsStartingBid(true);
+    startBidTimeoutRef.current = setTimeout(() => {
+      if (isStartingBidRef.current) {
+        clearPendingStartBid();
+        setAuctionError('Server did not confirm the start of bidding in time. Please try again.');
+      }
+    }, 8000);
+    return true;
   };
 
   const handlePlaceBid = (teamCode: string, amount: number) => {
@@ -360,7 +491,10 @@ export default function App() {
               <PlayerDisplayView
                 players={dbState.players}
                 activeAuction={dbState.activeAuction}
-                onSelectPlayer={(player) => setSelectedPlayer(player)}
+                onSelectPlayer={(player) => {
+                  setAuctionError(null);
+                  setSelectedPlayer(player);
+                }}
               />
             )}
 
@@ -393,13 +527,22 @@ export default function App() {
           player={dbState.players.find((p) => p.id === selectedPlayer.id) || selectedPlayer}
           auth={auth}
           activeAuction={dbState.activeAuction}
-          onClose={() => setSelectedPlayer(null)}
+          onClose={() => {
+            clearPendingStartBid();
+            setAuctionError(null);
+            setSelectedPlayer(null);
+          }}
           onStartBid={handleStartBid}
           onReAuction={handleReAuctionPlayer}
           onOpenLiveAuction={() => {
+            clearPendingStartBid();
+            setAuctionError(null);
             setSelectedPlayer(null);
             setIsArenaActive(true);
           }}
+          isStartingBid={isStartingBid}
+          startError={auctionError}
+          onClearStartError={() => setAuctionError(null)}
         />
       )}
 
