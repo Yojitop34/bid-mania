@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Team, Player, UserAuth } from '../types';
 import { Shield, Check, Pencil, KeyRound, X } from 'lucide-react';
 
@@ -6,14 +6,19 @@ interface TeamInfoViewProps {
   teams: Team[];
   players: Player[];
   auth: UserAuth | null;
+  resetCounter?: number;
   onUpdateTeamName: (teamId: string, name: string) => void;
-  onUpdateTeamCode: (teamId: string, code: string) => void;
+  onUpdateTeamCode: (
+    teamId: string,
+    code: string
+  ) => Promise<{ ok: boolean; loginCode?: string; error?: string }>;
 }
 
 export default function TeamInfoView({
   teams,
   players,
   auth,
+  resetCounter = 0,
   onUpdateTeamName,
   onUpdateTeamCode,
 }: TeamInfoViewProps) {
@@ -21,18 +26,49 @@ export default function TeamInfoView({
   const [editingModalTeam, setEditingModalTeam] = useState<Team | null>(null);
   const [modalNameInput, setModalNameInput] = useState<string>('');
 
-  // Team Code inputs & saved states for Admin
+  // Team Code inputs & saved states for Admin (loaded from authenticated admin endpoint only)
+  const [adminTeamCodes, setAdminTeamCodes] = useState<Record<string, string>>({});
   const [codeInputs, setCodeInputs] = useState<Record<string, string>>({});
   const [savedCodeTeamId, setSavedCodeTeamId] = useState<string | null>(null);
+  const [savingCodeTeamId, setSavingCodeTeamId] = useState<string | null>(null);
+  const [codeErrors, setCodeErrors] = useState<Record<string, string | null>>({});
 
   const isAdmin = auth?.role === 'admin';
 
-  const defaultCodes: Record<string, string> = {
-    team_a: 'TEAMA777',
-    team_b: 'TEAMB777',
-    team_c: 'TEAMC777',
-    team_d: 'TEAMD777',
-  };
+  useEffect(() => {
+    if (!isAdmin || !auth?.sessionToken) {
+      setAdminTeamCodes({});
+      setCodeInputs({});
+      setCodeErrors({});
+      return;
+    }
+
+    let cancelled = false;
+    fetch('/api/admin/team-codes', {
+      headers: {
+        Authorization: `Bearer ${auth.sessionToken}`,
+      },
+      cache: 'no-store',
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (cancelled || !data?.teamCodes || !Array.isArray(data.teamCodes)) return;
+        const map: Record<string, string> = {};
+        for (const item of data.teamCodes) {
+          if (item && typeof item.id === 'string' && typeof item.loginCode === 'string') {
+            map[item.id] = item.loginCode;
+          }
+        }
+        setAdminTeamCodes(map);
+        setCodeInputs({});
+        setCodeErrors({});
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isAdmin, auth?.sessionToken, resetCounter]);
 
   const handleOpenEditModal = (team: Team) => {
     setEditingModalTeam(team);
@@ -53,22 +89,38 @@ export default function TeamInfoView({
 
   const handleCodeInputChange = (teamId: string, val: string) => {
     setCodeInputs((prev) => ({ ...prev, [teamId]: val }));
+    setCodeErrors((prev) => ({ ...prev, [teamId]: null }));
   };
 
-  const handleSaveCode = (teamId: string) => {
-    const team = teams.find((t) => t.id === teamId);
-    const fallbackCode = defaultCodes[teamId] || 'TEAM777';
+  const handleSaveCode = async (teamId: string) => {
     const currentVal =
-      codeInputs[teamId] !== undefined
-        ? codeInputs[teamId]
-        : team?.loginCode || fallbackCode;
+      codeInputs[teamId] !== undefined ? codeInputs[teamId] : adminTeamCodes[teamId] || '';
 
     const trimmed = currentVal.trim().toUpperCase();
-    if (!trimmed) return;
+    if (!trimmed) {
+      setCodeErrors((prev) => ({ ...prev, [teamId]: 'Please enter a Team Code.' }));
+      return;
+    }
 
-    onUpdateTeamCode(teamId, trimmed);
+    setSavingCodeTeamId(teamId);
+    setCodeErrors((prev) => ({ ...prev, [teamId]: null }));
+
+    const result = await onUpdateTeamCode(teamId, trimmed);
+    setSavingCodeTeamId(null);
+
+    if (!result.ok) {
+      setCodeErrors((prev) => ({
+        ...prev,
+        [teamId]: result.error || 'Failed to update team code.',
+      }));
+      return;
+    }
+
+    const updatedCode = result.loginCode || trimmed;
+    setAdminTeamCodes((prev) => ({ ...prev, [teamId]: updatedCode }));
+    setCodeInputs((prev) => ({ ...prev, [teamId]: updatedCode }));
     setSavedCodeTeamId(teamId);
-    setTimeout(() => setSavedCodeTeamId(null), 2000);
+    setTimeout(() => setSavedCodeTeamId((prev) => (prev === teamId ? null : prev)), 2000);
   };
 
   return (
@@ -99,11 +151,10 @@ export default function TeamInfoView({
           const hasCustomName = Boolean(team.name && team.name.trim());
           const displayName = hasCustomName ? team.name.trim() : team.code;
 
-          const fallbackCode = defaultCodes[team.id] || 'TEAM777';
           const currentCodeInput =
             codeInputs[team.id] !== undefined
               ? codeInputs[team.id]
-              : team.loginCode || fallbackCode;
+              : adminTeamCodes[team.id] || '';
 
           const batsmenCount = teamPlayers.filter((p) => p.role === 'Batsman').length;
           const bowlersCount = teamPlayers.filter((p) => p.role === 'Bowler').length;
@@ -264,24 +315,32 @@ export default function TeamInfoView({
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') handleSaveCode(team.id);
                       }}
-                      placeholder={fallbackCode}
+                      placeholder="Enter Team Code"
                       className="flex-1 px-3 py-1.5 text-xs sm:text-sm font-mono font-bold tracking-wider border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 bg-slate-50/50 uppercase"
                     />
                     <button
                       type="button"
+                      disabled={savingCodeTeamId === team.id}
                       onClick={() => handleSaveCode(team.id)}
-                      className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-500 active:scale-95 text-white text-xs font-semibold rounded-lg shadow-xs transition flex items-center gap-1 cursor-pointer shrink-0"
+                      className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-500 active:scale-95 text-white text-xs font-semibold rounded-lg shadow-xs transition flex items-center gap-1 cursor-pointer shrink-0 disabled:opacity-50"
                     >
                       {savedCodeTeamId === team.id ? (
                         <>
                           <Check className="w-3.5 h-3.5 text-white" />
                           <span>Saved</span>
                         </>
+                      ) : savingCodeTeamId === team.id ? (
+                        <span>Saving...</span>
                       ) : (
                         <span>Save</span>
                       )}
                     </button>
                   </div>
+                  {codeErrors[team.id] && (
+                    <p className="mt-1.5 text-[11px] font-medium text-rose-600">
+                      {codeErrors[team.id]}
+                    </p>
+                  )}
                 </div>
               )}
             </div>

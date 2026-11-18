@@ -25,7 +25,6 @@ export interface Team {
   totalSpent: number; // 0
   totalValue: number; // 5000 initial
   isQualified: boolean;
-  loginCode?: string; // custom login code (default TEAMA777, TEAMB777, etc.)
 }
 
 export interface BidHistoryItem {

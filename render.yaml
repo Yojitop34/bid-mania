@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: bid-mania
+    runtime: node
+    plan: starter
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+    disk:
+      name: bid-mania-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /var/data
+      - key: TRUST_PROXY
+        value: "true"
+      - key: ADMIN_DEFAULT_CODE
+        sync: false
+      - key: ADMIN_CODE_CHANGE_PASSWORD
+        sync: false

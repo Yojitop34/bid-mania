@@ -49,6 +49,7 @@ export default function App() {
   });
   const [auctionError, setAuctionError] = useState<string | null>(null);
   const [isStartingBid, setIsStartingBid] = useState<boolean>(false);
+  const [dbResetCount, setDbResetCount] = useState<number>(0);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
     try {
       return localStorage.getItem('apl_sound') !== 'false';
@@ -165,7 +166,6 @@ export default function App() {
             setAuth(null);
             try {
               sessionStorage.removeItem('apl_auth');
-              localStorage.removeItem('apl_auth');
             } catch {
               // ignore
             }
@@ -184,6 +184,9 @@ export default function App() {
             data.type === 'DATABASE_CLEARED'
           ) {
             setDbState(data.state);
+            if (data.type === 'DATABASE_CLEARED') {
+              setDbResetCount((prev) => prev + 1);
+            }
             if (data.state?.activeAuction?.status === 'bidding') {
               clearPendingStartBid();
               setSelectedPlayer(null);
@@ -274,7 +277,6 @@ export default function App() {
     setAuctionError(null);
     try {
       sessionStorage.setItem('apl_auth', JSON.stringify(newAuth));
-      localStorage.setItem('apl_auth', JSON.stringify(newAuth));
     } catch {
       // ignore
     }
@@ -297,7 +299,6 @@ export default function App() {
     setAuth(null);
     try {
       sessionStorage.removeItem('apl_auth');
-      localStorage.removeItem('apl_auth');
     } catch {
       // ignore
     }
@@ -348,8 +349,30 @@ export default function App() {
     sendWs({ type: 'UPDATE_TEAM_NAME', teamId, name });
   };
 
-  const handleUpdateTeamCode = (teamId: string, code: string) => {
-    sendWs({ type: 'UPDATE_TEAM_CODE', teamId, code });
+  const handleUpdateTeamCode = async (
+    teamId: string,
+    code: string
+  ): Promise<{ ok: boolean; loginCode?: string; error?: string }> => {
+    if (!auth?.sessionToken) {
+      return { ok: false, error: 'Admin authentication required.' };
+    }
+    try {
+      const res = await fetch('/api/admin/team-codes', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${auth.sessionToken}`,
+        },
+        body: JSON.stringify({ teamId, code }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return { ok: false, error: data?.error || 'Failed to update team code.' };
+      }
+      return { ok: true, loginCode: data.loginCode };
+    } catch {
+      return { ok: false, error: 'Network error while updating team code.' };
+    }
   };
 
   const handleUpdatePurse = (teamId: string, newPurse: number) => {
@@ -505,6 +528,7 @@ export default function App() {
                 teams={dbState.teams}
                 players={dbState.players}
                 auth={auth}
+                resetCounter={dbResetCount}
                 onUpdateTeamName={handleUpdateTeamName}
                 onUpdateTeamCode={handleUpdateTeamCode}
               />

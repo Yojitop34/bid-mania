@@ -93,6 +93,14 @@ function getAdminCodeChangePassword(): string | null {
   return raw;
 }
 
+function isValidAdminCodeFormat(normalizedCode: string): boolean {
+  return (
+    normalizedCode.length >= 4 &&
+    normalizedCode.length <= 64 &&
+    !/[\x00-\x1F\x7F\s]/.test(normalizedCode)
+  );
+}
+
 function hashAdminCode(normalizedCode: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
   const derived = crypto.scryptSync(normalizedCode, salt, 64).toString('hex');
@@ -119,8 +127,108 @@ function verifyAdminCodeHash(normalizedCode: string, storedHash: unknown): boole
   return crypto.timingSafeEqual(actualBuf, expectedBuf);
 }
 
-const DATA_DIR = path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'auction_database.json');
+function isRenderEnvironment(): boolean {
+  return (
+    process.env.RENDER === 'true' ||
+    process.env.RENDER === '1' ||
+    Boolean(process.env.RENDER_SERVICE_ID)
+  );
+}
+
+function validateRenderPersistentDir(targetDir: string) {
+  if (!fs.existsSync(targetDir)) {
+    throw new Error(
+      `FATAL: Persistent disk directory "${targetDir}" does not exist on Render. Refusing to fall back to a temporary filesystem.`
+    );
+  }
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(targetDir);
+  } catch (err: any) {
+    throw new Error(
+      `FATAL: Unable to inspect persistent disk directory "${targetDir}": ${err?.message || err}`
+    );
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(
+      `FATAL: Persistent disk path "${targetDir}" is not a directory. Refusing to fall back to a temporary filesystem.`
+    );
+  }
+  try {
+    fs.accessSync(targetDir, fs.constants.R_OK | fs.constants.W_OK);
+  } catch (err: any) {
+    throw new Error(
+      `FATAL: Persistent disk directory "${targetDir}" is not readable and writable: ${err?.message || err}`
+    );
+  }
+}
+
+function resolveDatabasePaths(): { dataDir: string; dbFile: string } {
+  const rawDbPath = (process.env.DATABASE_PATH || process.env.DB_FILE_PATH || '').trim();
+  const rawDataDir = (process.env.DATA_DIR || process.env.RENDER_DISK_PATH || '').trim();
+  const onRender = isRenderEnvironment();
+
+  let dataDir: string;
+  let dbFile: string;
+
+  if (rawDbPath) {
+    dbFile = path.resolve(rawDbPath);
+    dataDir = path.dirname(dbFile);
+  } else if (rawDataDir) {
+    dataDir = path.resolve(rawDataDir);
+    dbFile = path.join(dataDir, 'auction_database.json');
+  } else {
+    if (onRender) {
+      throw new Error(
+        'FATAL: Persistent storage is required on Render. Set DATA_DIR (e.g. /var/data) or DATABASE_PATH pointing to your mounted Render persistent disk. Refusing to fall back to a temporary filesystem.'
+      );
+    }
+    dataDir = path.join(__dirname, 'data');
+    dbFile = path.join(dataDir, 'auction_database.json');
+  }
+
+  if (onRender) {
+    const resolvedAppRoot = path.resolve(__dirname);
+    const relativeToApp = path.relative(resolvedAppRoot, dbFile);
+    const isInsideAppRoot =
+      relativeToApp === '' ||
+      (!relativeToApp.startsWith('..') && !path.isAbsolute(relativeToApp));
+    if (isInsideAppRoot) {
+      throw new Error(
+        `FATAL: Database path "${dbFile}" points inside the ephemeral application directory "${resolvedAppRoot}" on Render. Configure DATA_DIR to your mounted persistent disk (e.g. /var/data).`
+      );
+    }
+    validateRenderPersistentDir(dataDir);
+  }
+
+  return { dataDir, dbFile };
+}
+
+const { dataDir: DATA_DIR, dbFile: DB_FILE } = resolveDatabasePaths();
+
+function writeDatabaseStateAtomically(filePath: string, state: DatabaseState) {
+  const dir = path.dirname(filePath);
+  const tmpPath = path.join(
+    dir,
+    `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
+  );
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2), {
+      encoding: 'utf-8',
+      mode: 0o600,
+    });
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) {
+        fs.unlinkSync(tmpPath);
+      }
+    } catch {
+      // ignore temp cleanup failure
+    }
+    throw err;
+  }
+}
 
 // Constant Fixed Starting Teams and Players as specified
 function getInitialTeams(): Team[] {
@@ -694,19 +802,213 @@ export function calculateQualification(teamId: string, players: Player[]) {
   };
 }
 
-// Database Layer with File Persistence & Auto-Migrations
+function buildSeededDatabaseState(adminCodeHash?: string): DatabaseState {
+  return {
+    config: {
+      gameCode: 'APL2026',
+      ...(adminCodeHash ? { adminCodeHash } : {}),
+    },
+    universalPurse: 800,
+    teams: getInitialTeams(),
+    players: getInitialPlayers(),
+    activeAuction: {
+      playerId: null,
+      biddingType: 'online',
+      currentBid: null,
+      currentTeam: null,
+      timerSeconds: 30,
+      timerDuration: 30,
+      timerRunning: false,
+      status: 'idle',
+      bidHistory: [],
+      startedAt: null,
+    },
+    auditLogs: [
+      {
+        id: 'init_1',
+        action: 'DATABASE_INITIALIZED',
+        timestamp: new Date().toISOString(),
+        details: { message: 'Database initialized explicitly.' },
+      },
+    ],
+  };
+}
+
+function isValidPersistedDatabaseShape(candidate: unknown): candidate is DatabaseState {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return false;
+  }
+  const obj = candidate as Record<string, unknown>;
+  return (
+    Array.isArray(obj.teams) &&
+    obj.teams.length > 0 &&
+    Array.isArray(obj.players) &&
+    obj.players.length > 0 &&
+    Boolean(obj.activeAuction) &&
+    typeof obj.activeAuction === 'object' &&
+    !Array.isArray(obj.activeAuction)
+  );
+}
+
+function parseCliFlags(argv: string[]): {
+  command: 'init-db' | 'recover-admin' | null;
+  code: string | null;
+  useDefault: boolean;
+} {
+  let command: 'init-db' | 'recover-admin' | null = null;
+  let code: string | null = null;
+  let useDefault = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--init-db') {
+      command = 'init-db';
+    } else if (arg === '--recover-admin') {
+      command = 'recover-admin';
+    } else if (arg === '--use-default') {
+      useDefault = true;
+    } else if (arg === '--code' && i + 1 < argv.length) {
+      code = argv[++i];
+    } else if (arg.startsWith('--code=')) {
+      code = arg.slice('--code='.length);
+    }
+  }
+
+  return { command, code, useDefault };
+}
+
+function runCliInitDb(): never {
+  if (fs.existsSync(DB_FILE)) {
+    console.error(
+      `REFUSED: Persistent database already exists at ${DB_FILE}. First-time initialization will never overwrite an active database or Admin Code. Use "npm run recover-admin -- --code <NEW_CODE>" if you need to recover Admin access.`
+    );
+    process.exit(1);
+  }
+
+  const defaultAdminCode = getDefaultAdminCode();
+  if (!defaultAdminCode || !isValidAdminCodeFormat(defaultAdminCode)) {
+    console.error(
+      'ERROR: ADMIN_DEFAULT_CODE must be set to 4-64 non-whitespace characters for first-time database initialization.'
+    );
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(DATA_DIR)) {
+    if (isRenderEnvironment()) {
+      console.error(`FATAL: Persistent disk directory "${DATA_DIR}" is unavailable on Render.`);
+      process.exit(1);
+    }
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+
+  const initialState = buildSeededDatabaseState(hashAdminCode(defaultAdminCode));
+  writeDatabaseStateAtomically(DB_FILE, initialState);
+  console.log(
+    `Initialized persistent database at ${DB_FILE} with salted scrypt hash of ADMIN_DEFAULT_CODE.`
+  );
+  console.log('Restart the application server if it is currently running.');
+  process.exit(0);
+}
+
+function runCliRecoverAdmin(codeArg: string | null, useDefault: boolean): never {
+  if (!fs.existsSync(DB_FILE)) {
+    console.error(
+      `ERROR: No persistent database exists at ${DB_FILE}. Run "npm run init-db" for first-time initialization.`
+    );
+    process.exit(1);
+  }
+
+  let parsed: unknown;
+  try {
+    const raw = fs.readFileSync(DB_FILE, 'utf-8');
+    parsed = JSON.parse(raw);
+  } catch (err: any) {
+    console.error(
+      `ERROR: Persistent database at ${DB_FILE} could not be read or parsed as JSON (${err?.message || err}). Refusing to overwrite existing data.`
+    );
+    process.exit(1);
+  }
+
+  if (!isValidPersistedDatabaseShape(parsed)) {
+    console.error(
+      `ERROR: Persistent database at ${DB_FILE} has an invalid schema. Refusing to overwrite existing data.`
+    );
+    process.exit(1);
+  }
+
+  let recoveryRaw = codeArg ?? process.env.ADMIN_RECOVERY_CODE ?? null;
+  if (!recoveryRaw && useDefault) {
+    recoveryRaw = getDefaultAdminCode();
+  }
+
+  if (!recoveryRaw) {
+    console.error(
+      'Usage: npm run recover-admin -- --code <NEW_ADMIN_CODE>  (or set ADMIN_RECOVERY_CODE, or pass --use-default to explicitly re-seed from ADMIN_DEFAULT_CODE).'
+    );
+    process.exit(1);
+  }
+
+  const normalizedCode = recoveryRaw.trim().toUpperCase();
+  if (!isValidAdminCodeFormat(normalizedCode)) {
+    console.error(
+      'ERROR: Recovery Admin Code must be 4-64 characters with no spaces or control characters.'
+    );
+    process.exit(1);
+  }
+
+  if (!parsed.config || typeof parsed.config !== 'object') {
+    parsed.config = { gameCode: 'APL2026' };
+  }
+  parsed.config.gameCode = 'APL2026';
+  if ('adminCode' in parsed.config) {
+    delete parsed.config.adminCode;
+  }
+  parsed.config.adminCodeHash = hashAdminCode(normalizedCode);
+
+  if (!Array.isArray(parsed.auditLogs)) {
+    parsed.auditLogs = [];
+  }
+  parsed.auditLogs.push({
+    id: `admin_recover_${Date.now()}`,
+    action: 'ADMIN_CODE_RECOVERED',
+    timestamp: new Date().toISOString(),
+    details: { message: 'Admin login code was explicitly recovered via CLI.' },
+  });
+
+  writeDatabaseStateAtomically(DB_FILE, parsed);
+  console.log(
+    `Recovered Admin Code hash in ${DB_FILE} while preserving all teams, players, purses, and auction state.`
+  );
+  console.log('Restart the application server if it is currently running.');
+  process.exit(0);
+}
+
+const cliFlags = parseCliFlags(process.argv.slice(2));
+if (cliFlags.command === 'init-db') {
+  runCliInitDb();
+} else if (cliFlags.command === 'recover-admin') {
+  runCliRecoverAdmin(cliFlags.code, cliFlags.useDefault);
+}
+
+export type DatabaseStatus = 'ready' | 'missing' | 'corrupt' | 'missing_admin_hash';
+
+// Database Layer with File Persistence & Fail-Secure Authority
 class AuctionDatabase {
   private state: DatabaseState;
+  private dbStatus: DatabaseStatus = 'missing';
+  private persistenceEnabled = false;
+  private statusMessage = '';
 
   constructor() {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-
     if (fs.existsSync(DB_FILE)) {
       try {
         const raw = fs.readFileSync(DB_FILE, 'utf-8');
-        this.state = JSON.parse(raw);
+        const parsed = JSON.parse(raw);
+        if (!isValidPersistedDatabaseShape(parsed)) {
+          throw new Error('Invalid persistent database structure.');
+        }
+        this.state = parsed;
+
         if (!this.state.config || typeof this.state.config !== 'object') {
           this.state.config = { gameCode: 'APL2026' };
         }
@@ -717,16 +1019,20 @@ class AuctionDatabase {
           delete this.state.config.adminCode;
           needsSave = true;
         }
-        if (!isValidAdminCodeHashFormat(this.state.config.adminCodeHash)) {
-          const defaultAdminCode = getDefaultAdminCode();
-          if (defaultAdminCode) {
-            this.state.config.adminCodeHash = hashAdminCode(defaultAdminCode);
-          } else {
-            delete this.state.config.adminCodeHash;
-            console.error('ADMIN_DEFAULT_CODE is not configured; admin login is disabled.');
-          }
-          needsSave = true;
+        if (isValidAdminCodeHashFormat(this.state.config.adminCodeHash)) {
+          this.dbStatus = 'ready';
+          this.persistenceEnabled = true;
+          this.statusMessage = '';
+        } else {
+          // NEVER silently recreate or fall back to ADMIN_DEFAULT_CODE
+          delete this.state.config.adminCodeHash;
+          this.dbStatus = 'missing_admin_hash';
+          this.persistenceEnabled = true;
+          this.statusMessage =
+            'Persistent database is missing a valid adminCodeHash. Admin login is disabled; run explicit recovery ("npm run recover-admin -- --code <NEW_CODE>").';
+          console.error(`CRITICAL: ${this.statusMessage}`);
         }
+
         // Ensure teams have loginCode initialized
         const defaultCodes: Record<string, string> = {
           team_a: 'TEAMA777',
@@ -737,32 +1043,45 @@ class AuctionDatabase {
         for (const team of this.state.teams) {
           if (!team.loginCode) {
             team.loginCode = defaultCodes[team.id] || `${team.code.replace(/\s+/g, '').toUpperCase()}777`;
+            needsSave = true;
           }
           if (team.adjustedBudget === undefined) {
             team.adjustedBudget = team.baseBudget;
+            needsSave = true;
           }
         }
         if (!this.state.activeAuction.biddingType) {
           this.state.activeAuction.biddingType = 'online';
+          needsSave = true;
         }
         if (this.state.universalPurse === undefined) {
           this.state.universalPurse = 800;
+          needsSave = true;
         }
-        if (needsSave) {
+        if (!Array.isArray(this.state.auditLogs)) {
+          this.state.auditLogs = [];
+          needsSave = true;
+        }
+        if (needsSave && this.dbStatus === 'ready') {
           this.save();
         }
       } catch (e) {
-        console.error('Error loading db file, re-initializing', e);
-        this.state = this.createDefaultState();
-        this.save();
+        this.dbStatus = 'corrupt';
+        this.persistenceEnabled = false;
+        this.statusMessage = `Persistent database file at ${DB_FILE} is unreadable or corrupted. Refusing to recreate default admin credentials.`;
+        console.error(`CRITICAL: ${this.statusMessage}`, e);
+        this.state = this.createEphemeralFallbackState();
       }
     } else {
-      this.state = this.createDefaultState();
-      this.save();
+      this.dbStatus = 'missing';
+      this.persistenceEnabled = false;
+      this.statusMessage = `Persistent database not found at ${DB_FILE}. Run explicit first-time initialization ("npm run init-db") with ADMIN_DEFAULT_CODE configured.`;
+      console.error(`CRITICAL: ${this.statusMessage}`);
+      this.state = this.createEphemeralFallbackState();
     }
 
     this.syncImageUrls();
-    this.recalculateAllTeams();
+    this.recalculateAllTeams(this.dbStatus === 'ready');
   }
 
   // Keeps imageUrl AND name in an already-saved database in sync with the seed above,
@@ -777,55 +1096,57 @@ class AuctionDatabase {
     }
   }
 
-  private createDefaultState(): DatabaseState {
-    const defaultAdminCode = getDefaultAdminCode();
-    if (!defaultAdminCode) {
-      console.error('ADMIN_DEFAULT_CODE is not configured; admin login is disabled.');
-    }
+  // Used only in memory when persistent DB is missing or corrupted; intentionally omits adminCodeHash and never saves to disk.
+  private createEphemeralFallbackState(): DatabaseState {
+    return buildSeededDatabaseState(undefined);
+  }
+
+  public getDatabaseStatus(): {
+    status: DatabaseStatus;
+    persistenceEnabled: boolean;
+    message: string;
+  } {
     return {
-      config: {
-        gameCode: 'APL2026',
-        ...(defaultAdminCode ? { adminCodeHash: hashAdminCode(defaultAdminCode) } : {}),
-      },
-      universalPurse: 800,
-      teams: getInitialTeams(),
-      players: getInitialPlayers(),
-      activeAuction: {
-        playerId: null,
-        biddingType: 'online',
-        currentBid: null,
-        currentTeam: null,
-        timerSeconds: 30,
-        timerDuration: 30,
-        timerRunning: false,
-        status: 'idle',
-        bidHistory: [],
-        startedAt: null,
-      },
-      auditLogs: [
-        {
-          id: 'init_1',
-          action: 'DATABASE_INITIALIZED',
-          timestamp: new Date().toISOString(),
-          details: { message: 'Database schema migrated and seeded.' },
-        },
-      ],
+      status: this.dbStatus,
+      persistenceEnabled: this.persistenceEnabled,
+      message: this.statusMessage,
     };
   }
 
+  public isAdminAuthReady(): boolean {
+    return (
+      this.dbStatus === 'ready' &&
+      isValidAdminCodeHashFormat(this.state.config.adminCodeHash)
+    );
+  }
+
+  public isDatabaseIntact(): boolean {
+    return (
+      this.persistenceEnabled &&
+      (this.dbStatus === 'ready' || this.dbStatus === 'missing_admin_hash')
+    );
+  }
+
   public save() {
-    try {
-      fs.writeFileSync(DB_FILE, JSON.stringify(this.state, null, 2), 'utf-8');
-    } catch (err) {
-      console.error('Failed to write database file', err);
+    if (!this.persistenceEnabled) {
+      throw new Error(
+        'Database persistence is disabled because the persistent database is missing or corrupted.'
+      );
     }
+    if (!fs.existsSync(DATA_DIR)) {
+      if (isRenderEnvironment()) {
+        throw new Error(`Persistent disk directory "${DATA_DIR}" is unavailable on Render.`);
+      }
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    writeDatabaseStateAtomically(DB_FILE, this.state);
   }
 
   public getState(): DatabaseState {
     return this.state;
   }
 
-  public recalculateAllTeams() {
+  public recalculateAllTeams(shouldSave: boolean = true) {
     for (const team of this.state.teams) {
       const teamPlayers = this.state.players.filter((p) => p.teamId === team.id);
       
@@ -845,7 +1166,9 @@ class AuctionDatabase {
       const qual = calculateQualification(team.id, this.state.players);
       team.isQualified = qual.isQualified;
     }
-    this.save();
+    if (shouldSave && this.persistenceEnabled) {
+      this.save();
+    }
   }
 
   public updateTeamName(teamId: string, name: string) {
@@ -887,6 +1210,11 @@ class AuctionDatabase {
   }
 
   public updateAdminCode(normalizedNewCode: string) {
+    if (!this.isDatabaseIntact()) {
+      throw new Error('Cannot update admin code: persistent database is missing or corrupted.');
+    }
+    const previousHash = this.state.config.adminCodeHash;
+    const previousAuditLength = this.state.auditLogs.length;
     this.state.config.adminCodeHash = hashAdminCode(normalizedNewCode);
     if ('adminCode' in this.state.config) {
       delete this.state.config.adminCode;
@@ -897,17 +1225,29 @@ class AuctionDatabase {
       timestamp: new Date().toISOString(),
       details: { message: 'Admin login code was updated.' },
     });
-    this.save();
+    try {
+      this.save();
+      this.dbStatus = 'ready';
+      this.statusMessage = '';
+    } catch (err) {
+      if (previousHash !== undefined) {
+        this.state.config.adminCodeHash = previousHash;
+      } else {
+        delete this.state.config.adminCodeHash;
+      }
+      this.state.auditLogs.length = previousAuditLength;
+      throw err;
+    }
   }
 
   public clearDatabase() {
-    const defaultAdminCode = getDefaultAdminCode();
-    if (!defaultAdminCode) {
-      throw new Error('Reset unavailable: default admin code configuration is missing.');
+    const currentAdminCodeHash = this.state.config.adminCodeHash;
+    if (!this.isAdminAuthReady() || !isValidAdminCodeHashFormat(currentAdminCodeHash)) {
+      throw new Error('Reset unavailable: active admin code hash is missing.');
     }
 
-    // Reset all 4 team purses back to $800M, restore default admin code hash, and reset state
-    this.state.config.adminCodeHash = hashAdminCode(defaultAdminCode);
+    // Reset all 4 team purses back to $800M and reset auction/teams while preserving the active admin code hash
+    this.state.config.adminCodeHash = currentAdminCodeHash;
     if ('adminCode' in this.state.config) {
       delete this.state.config.adminCode;
     }
@@ -930,9 +1270,11 @@ class AuctionDatabase {
       id: `clear_${Date.now()}`,
       action: 'CLEAR_DATABASE',
       timestamp: new Date().toISOString(),
-      details: { message: 'Admin reset database to starting state.' },
+      details: {
+        message: 'Admin reset database to starting state (active admin code preserved).',
+      },
     });
-    this.recalculateAllTeams();
+    this.recalculateAllTeams(false);
     this.save();
   }
 
@@ -1223,7 +1565,6 @@ function publicState() {
       totalSpent: t.totalSpent,
       totalValue: t.totalValue,
       isQualified: t.isQualified,
-      loginCode: t.loginCode,
     })),
     players: state.players.map((p) => ({
       id: p.id,
@@ -1509,6 +1850,170 @@ function getClientIp(req?: IncomingMessage): string {
   }
 
   return socketIp;
+}
+
+interface AuthRateLimitEntry {
+  failures: number;
+  blockedUntil: number;
+  lastAttemptAt: number;
+}
+
+const AUTH_MAX_FAILED_ATTEMPTS = 10;
+const AUTH_COOLDOWN_MS = 30_000;
+const AUTH_LIMITER_MAX_ENTRIES = 10_000;
+const AUTH_LIMITER_IDLE_TTL_MS = 15 * 60 * 1000;
+const AUTH_LIMITER_CLEANUP_INTERVAL_MS = 60_000;
+
+class AuthRateLimiter {
+  private entries = new Map<string, AuthRateLimitEntry>();
+
+  public check(ip: string, now: number = Date.now()): { blocked: boolean; retryAfterSeconds: number } {
+    const entry = this.entries.get(ip);
+    if (!entry) {
+      return { blocked: false, retryAfterSeconds: 0 };
+    }
+
+    if (entry.blockedUntil > 0) {
+      if (now < entry.blockedUntil) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((entry.blockedUntil - now) / 1000));
+        return { blocked: true, retryAfterSeconds };
+      }
+      this.entries.delete(ip);
+      return { blocked: false, retryAfterSeconds: 0 };
+    }
+
+    if (now - entry.lastAttemptAt > AUTH_LIMITER_IDLE_TTL_MS) {
+      this.entries.delete(ip);
+    }
+    return { blocked: false, retryAfterSeconds: 0 };
+  }
+
+  public recordFailure(
+    ip: string,
+    now: number = Date.now()
+  ): { cooldownActivated: boolean; retryAfterSeconds: number; failures: number } {
+    let entry = this.entries.get(ip);
+    if (
+      entry &&
+      ((entry.blockedUntil > 0 && now >= entry.blockedUntil) ||
+        now - entry.lastAttemptAt > AUTH_LIMITER_IDLE_TTL_MS)
+    ) {
+      this.entries.delete(ip);
+      entry = undefined;
+    }
+
+    if (!entry) {
+      if (this.entries.size >= AUTH_LIMITER_MAX_ENTRIES) {
+        this.cleanup(now);
+        if (this.entries.size >= AUTH_LIMITER_MAX_ENTRIES) {
+          const oldestKey = this.entries.keys().next().value;
+          if (oldestKey !== undefined) {
+            this.entries.delete(oldestKey);
+          }
+        }
+      }
+      entry = { failures: 0, blockedUntil: 0, lastAttemptAt: now };
+    } else {
+      // Refresh insertion order for bounded LRU eviction
+      this.entries.delete(ip);
+    }
+
+    entry.failures += 1;
+    entry.lastAttemptAt = now;
+
+    if (entry.failures >= AUTH_MAX_FAILED_ATTEMPTS) {
+      entry.blockedUntil = now + AUTH_COOLDOWN_MS;
+      this.entries.set(ip, entry);
+      return {
+        cooldownActivated: true,
+        retryAfterSeconds: Math.ceil(AUTH_COOLDOWN_MS / 1000),
+        failures: entry.failures,
+      };
+    }
+
+    this.entries.set(ip, entry);
+    return {
+      cooldownActivated: false,
+      retryAfterSeconds: 0,
+      failures: entry.failures,
+    };
+  }
+
+  public reset(ip: string): void {
+    this.entries.delete(ip);
+  }
+
+  public cleanup(now: number = Date.now()): void {
+    for (const [ip, entry] of this.entries.entries()) {
+      if (entry.blockedUntil > 0 && now >= entry.blockedUntil) {
+        this.entries.delete(ip);
+      } else if (entry.blockedUntil === 0 && now - entry.lastAttemptAt > AUTH_LIMITER_IDLE_TTL_MS) {
+        this.entries.delete(ip);
+      }
+    }
+  }
+
+  public clear(): void {
+    this.entries.clear();
+  }
+}
+
+const loginRateLimiter = new AuthRateLimiter();
+const adminCodeChangeRateLimiter = new AuthRateLimiter();
+
+const authLimiterCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  loginRateLimiter.cleanup(now);
+  adminCodeChangeRateLimiter.cleanup(now);
+}, AUTH_LIMITER_CLEANUP_INTERVAL_MS);
+authLimiterCleanupInterval.unref();
+
+function formatSecondsUnit(seconds: number): string {
+  return seconds === 1 ? 'second' : 'seconds';
+}
+
+function sendCooldownBlockedResponse(
+  res: Response,
+  retryAfterSeconds: number,
+  scope: 'login' | 'change-admin-code'
+) {
+  const safeSeconds = Math.max(1, retryAfterSeconds);
+  res.setHeader('Retry-After', String(safeSeconds));
+  const error =
+    scope === 'login'
+      ? `Login temporarily blocked. Please try again in ${safeSeconds} ${formatSecondsUnit(safeSeconds)}.`
+      : `Authorization temporarily blocked. Please try again in ${safeSeconds} ${formatSecondsUnit(safeSeconds)}.`;
+  return res.status(429).json({
+    error,
+    code: 'RATE_LIMIT_ACTIVE',
+    retryAfterSeconds: safeSeconds,
+    cooldownActivated: false,
+  });
+}
+
+function sendRateLimitedFailureResponse(
+  res: Response,
+  limiter: AuthRateLimiter,
+  clientIp: string,
+  statusCode: number,
+  failureMessage: string,
+  scope: 'login' | 'change-admin-code'
+) {
+  const outcome = limiter.recordFailure(clientIp);
+  if (outcome.cooldownActivated) {
+    res.setHeader('Retry-After', String(outcome.retryAfterSeconds));
+    const error =
+      scope === 'login'
+        ? 'Too many failed login attempts. Please wait 30 seconds before trying again.'
+        : 'Too many failed authorization attempts. Please wait 30 seconds before trying again.';
+    return res.status(429).json({
+      error,
+      code: 'RATE_LIMIT_COOLDOWN_ACTIVATED',
+      retryAfterSeconds: outcome.retryAfterSeconds,
+      cooldownActivated: true,
+    });
+  }
+  return res.status(statusCode).json({ error: failureMessage });
 }
 
 function tryAcquireIpConnectionSlot(clientIp: string): ConnectionIpTracking | null {
@@ -1894,18 +2399,66 @@ wss.on('error', (err) => {
 });
 
 app.disable('x-powered-by');
+
+// Enforce active cooldown BEFORE parsing JSON bodies so malformed payloads cannot bypass rate limiting
+app.post('/api/auth/login', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+  const cooldown = loginRateLimiter.check(getClientIp(req));
+  if (cooldown.blocked) {
+    return sendCooldownBlockedResponse(res, cooldown.retryAfterSeconds, 'login');
+  }
+  return next();
+});
+
+app.post('/api/auth/change-admin-code', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+  const cooldown = adminCodeChangeRateLimiter.check(getClientIp(req));
+  if (cooldown.blocked) {
+    return sendCooldownBlockedResponse(res, cooldown.retryAfterSeconds, 'change-admin-code');
+  }
+  return next();
+});
+
 app.use('/api', express.json({ limit: '16kb', strict: true }));
 
 // Catch malformed JSON / oversized JSON payloads before route handlers without leaking stack traces
-app.use('/api', (err: any, _req: Request, res: Response, next: NextFunction) => {
+app.use('/api', (err: any, req: Request, res: Response, next: NextFunction) => {
   if (!err) return next();
-  if (err.type === 'entity.parse.failed' || err instanceof SyntaxError) {
-    return res.status(400).json({ error: 'Malformed JSON request body.' });
+  const status = err.type === 'entity.too.large' ? 413 : 400;
+  const message =
+    err.type === 'entity.parse.failed' || err instanceof SyntaxError
+      ? 'Malformed JSON request body.'
+      : err.type === 'entity.too.large'
+      ? 'Request payload too large.'
+      : 'Invalid request.';
+
+  if (req.method === 'POST' && req.path === '/auth/login') {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    return sendRateLimitedFailureResponse(
+      res,
+      loginRateLimiter,
+      getClientIp(req),
+      status,
+      message,
+      'login'
+    );
   }
-  if (err.type === 'entity.too.large') {
-    return res.status(413).json({ error: 'Request payload too large.' });
+  if (req.method === 'POST' && req.path === '/auth/change-admin-code') {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    return sendRateLimitedFailureResponse(
+      res,
+      adminCodeChangeRateLimiter,
+      getClientIp(req),
+      status,
+      message,
+      'change-admin-code'
+    );
   }
-  return res.status(400).json({ error: 'Invalid request.' });
+  return res.status(status).json({ error: message });
 });
 
 // Serve local player photos (works in dev and production, on any domain)
@@ -1916,6 +2469,22 @@ app.use(
     dotfiles: 'ignore',
   })
 );
+
+function invalidateAllAdminSessions(
+  reason: string = 'Admin code was changed. Please log in again.'
+) {
+  for (const [token, session] of sessions.entries()) {
+    if (session.role === 'admin') {
+      sessions.delete(token);
+    }
+  }
+  wss.clients.forEach((client) => {
+    const meta = clientMetaMap.get(client);
+    if (meta && meta.authenticated && meta.role === 'admin') {
+      revokeSocketSession(client, meta, reason);
+    }
+  });
+}
 
 // Broadcast helper for authenticated WebSockets only
 function broadcast(payload: any) {
@@ -2016,6 +2585,9 @@ const auctionTimerInterval = setInterval(() => {
 function clearServerIntervals() {
   clearInterval(heartbeatInterval);
   clearInterval(auctionTimerInterval);
+  clearInterval(authLimiterCleanupInterval);
+  loginRateLimiter.clear();
+  adminCodeChangeRateLimiter.clear();
   wss.clients.forEach((client) => {
     const meta = clientMetaMap.get(client);
     if (meta) {
@@ -2587,15 +3159,60 @@ function timingSafeCodeEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(digestA, digestB);
 }
 
+function requireAdminSession(req: Request, res: Response): SessionRecord | null {
+  const authHeader = req.headers.authorization;
+  let token: string | null = null;
+  if (typeof authHeader === 'string') {
+    const match = /^Bearer\s+(\S+)$/i.exec(authHeader.trim());
+    if (match && match[1].length <= 256) {
+      token = match[1];
+    }
+  }
+  if (!token) {
+    res.status(401).json({ error: 'Authentication required.' });
+    return null;
+  }
+  const session = validateSession(token);
+  if (!session) {
+    res.status(401).json({ error: 'Invalid or expired session.' });
+    return null;
+  }
+  if (session.role !== 'admin') {
+    res.status(403).json({ error: 'Unauthorized: Admin privileges required.' });
+    return null;
+  }
+  return session;
+}
+
 // REST API Endpoints
 app.get('/api/state', (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.json(publicState());
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.get('/api/admin/team-codes', (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Pragma', 'no-cache');
+
+  if (!requireAdminSession(req, res)) {
+    return;
+  }
+
+  const teamCodes = db.getState().teams.map((t) => ({
+    id: t.id,
+    code: t.code,
+    loginCode: t.loginCode || '',
+  }));
+  return res.json({ teamCodes });
+});
+
+app.post('/api/admin/team-codes', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+
+  if (!requireAdminSession(req, res)) {
+    return;
+  }
 
   if (!req.is('application/json')) {
     return res.status(415).json({ error: 'Content-Type must be application/json.' });
@@ -2605,26 +3222,138 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(400).json({ error: 'Request body must be a JSON object.' });
   }
 
+  if (!hasOnlyAllowedKeys(req.body, ['teamId', 'code'])) {
+    return res.status(400).json({ error: 'Unexpected fields in team code request.' });
+  }
+
+  const { teamId, code } = req.body;
+  if (typeof teamId !== 'string' || !teamId.trim() || teamId.length > 64 || typeof code !== 'string') {
+    return res.status(400).json({ error: 'Invalid team code payload.' });
+  }
+
+  const trimmedCode = code.trim().toUpperCase();
+  if (trimmedCode.length < 2 || trimmedCode.length > 32 || /[\x00-\x1F\x7F\s]/.test(trimmedCode)) {
+    return res.status(400).json({
+      error: 'Team code must be 2-32 non-whitespace characters.',
+    });
+  }
+
+  const matchedTeam = findTeamByIdentifier(teamId);
+  if (!matchedTeam) {
+    return res.status(404).json({ error: 'Team not found.' });
+  }
+
+  const duplicateTeam = db
+    .getState()
+    .teams.find(
+      (t) =>
+        t.id !== matchedTeam.id &&
+        t.loginCode &&
+        t.loginCode.trim().toUpperCase() === trimmedCode
+    );
+  if (duplicateTeam) {
+    return res.status(409).json({
+      error: 'Team login code is already assigned to another team.',
+    });
+  }
+
+  db.updateTeamCode(matchedTeam.id, trimmedCode);
+  return res.json({
+    ok: true,
+    teamId: matchedTeam.id,
+    loginCode: trimmedCode,
+  });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+
+  const clientIp = getClientIp(req);
+  const cooldown = loginRateLimiter.check(clientIp);
+  if (cooldown.blocked) {
+    return sendCooldownBlockedResponse(res, cooldown.retryAfterSeconds, 'login');
+  }
+
+  if (!req.is('application/json')) {
+    return sendRateLimitedFailureResponse(
+      res,
+      loginRateLimiter,
+      clientIp,
+      415,
+      'Content-Type must be application/json.',
+      'login'
+    );
+  }
+
+  if (!isPlainObject(req.body)) {
+    return sendRateLimitedFailureResponse(
+      res,
+      loginRateLimiter,
+      clientIp,
+      400,
+      'Request body must be a JSON object.',
+      'login'
+    );
+  }
+
   if (!hasOnlyAllowedKeys(req.body, ['teamCode', 'adminCode'])) {
-    return res.status(400).json({ error: 'Unexpected fields in login request.' });
+    return sendRateLimitedFailureResponse(
+      res,
+      loginRateLimiter,
+      clientIp,
+      400,
+      'Unexpected fields in login request.',
+      'login'
+    );
   }
 
   const { teamCode, adminCode } = req.body;
   if (adminCode !== undefined && teamCode !== undefined) {
-    return res.status(400).json({ error: 'Provide either teamCode or adminCode, not both.' });
+    return sendRateLimitedFailureResponse(
+      res,
+      loginRateLimiter,
+      clientIp,
+      400,
+      'Provide either teamCode or adminCode, not both.',
+      'login'
+    );
   }
 
   const config = db.getState().config;
+  const dbStatus = db.getDatabaseStatus();
 
   if (adminCode !== undefined) {
     if (typeof adminCode !== 'string' || adminCode.length > 64) {
-      return res.status(400).json({ error: 'Invalid Admin Code format.' });
+      return sendRateLimitedFailureResponse(
+        res,
+        loginRateLimiter,
+        clientIp,
+        400,
+        'Invalid Admin Code format.',
+        'login'
+      );
     }
     const cleaned = adminCode.trim().toUpperCase();
     if (!cleaned) {
-      return res.status(400).json({ error: 'Invalid Admin Code format.' });
+      return sendRateLimitedFailureResponse(
+        res,
+        loginRateLimiter,
+        clientIp,
+        400,
+        'Invalid Admin Code format.',
+        'login'
+      );
+    }
+    if (!db.isAdminAuthReady()) {
+      return res.status(503).json({
+        error:
+          'Admin login is unavailable because the persistent database is missing, corrupted, or lacks a valid admin code hash. Run explicit initialization or recovery.',
+        code: 'ADMIN_DB_UNAVAILABLE',
+      });
     }
     if (verifyAdminCodeHash(cleaned, config.adminCodeHash)) {
+      loginRateLimiter.reset(clientIp);
       const session = createSession('admin');
       return res.json({
         role: 'admin',
@@ -2633,21 +3362,52 @@ app.post('/api/auth/login', (req, res) => {
         expiresAt: session.expiresAt,
       });
     }
-    return res.status(401).json({ error: 'Invalid Admin Code. Access denied.' });
+    return sendRateLimitedFailureResponse(
+      res,
+      loginRateLimiter,
+      clientIp,
+      401,
+      'Invalid Admin Code. Access denied.',
+      'login'
+    );
   }
 
   if (teamCode !== undefined) {
     if (typeof teamCode !== 'string' || teamCode.length > 64) {
-      return res.status(400).json({ error: 'Invalid Team Code format.' });
+      return sendRateLimitedFailureResponse(
+        res,
+        loginRateLimiter,
+        clientIp,
+        400,
+        'Invalid Team Code format.',
+        'login'
+      );
     }
     const code = teamCode.trim().toUpperCase();
     if (!code) {
-      return res.status(400).json({ error: 'Invalid Team Code format.' });
+      return sendRateLimitedFailureResponse(
+        res,
+        loginRateLimiter,
+        clientIp,
+        400,
+        'Invalid Team Code format.',
+        'login'
+      );
+    }
+    if (!db.isDatabaseIntact()) {
+      return res.status(503).json({
+        error:
+          dbStatus.status === 'corrupt'
+            ? 'Login is unavailable because the persistent database is corrupted.'
+            : 'Login is unavailable because the persistent database has not been initialized.',
+        code: 'DB_UNAVAILABLE',
+      });
     }
     const matchedTeam = db
       .getState()
       .teams.find((t) => t.loginCode && t.loginCode.trim().toUpperCase() === code);
     if (matchedTeam) {
+      loginRateLimiter.reset(clientIp);
       const session = createSession('participant', matchedTeam);
       return res.json({
         role: 'participant',
@@ -2657,26 +3417,67 @@ app.post('/api/auth/login', (req, res) => {
         expiresAt: session.expiresAt,
       });
     }
-    return res.status(401).json({ error: 'Invalid Team Code. Please check and try again.' });
+    return sendRateLimitedFailureResponse(
+      res,
+      loginRateLimiter,
+      clientIp,
+      401,
+      'Invalid Team Code. Please check and try again.',
+      'login'
+    );
   }
 
-  return res.status(400).json({ error: 'Please enter a valid Team Code or Admin Code.' });
+  return sendRateLimitedFailureResponse(
+    res,
+    loginRateLimiter,
+    clientIp,
+    400,
+    'Please enter a valid Team Code or Admin Code.',
+    'login'
+  );
 });
 
 app.post('/api/auth/change-admin-code', (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Pragma', 'no-cache');
 
+  const clientIp = getClientIp(req);
+  const cooldown = adminCodeChangeRateLimiter.check(clientIp);
+  if (cooldown.blocked) {
+    return sendCooldownBlockedResponse(res, cooldown.retryAfterSeconds, 'change-admin-code');
+  }
+
   if (!req.is('application/json')) {
-    return res.status(415).json({ error: 'Content-Type must be application/json.' });
+    return sendRateLimitedFailureResponse(
+      res,
+      adminCodeChangeRateLimiter,
+      clientIp,
+      415,
+      'Content-Type must be application/json.',
+      'change-admin-code'
+    );
   }
 
   if (!isPlainObject(req.body)) {
-    return res.status(400).json({ error: 'Request body must be a JSON object.' });
+    return sendRateLimitedFailureResponse(
+      res,
+      adminCodeChangeRateLimiter,
+      clientIp,
+      400,
+      'Request body must be a JSON object.',
+      'change-admin-code'
+    );
   }
 
   if (!hasOnlyAllowedKeys(req.body, ['password', 'newAdminCode'])) {
-    return res.status(400).json({ error: 'Unexpected fields in request.' });
+    return sendRateLimitedFailureResponse(
+      res,
+      adminCodeChangeRateLimiter,
+      clientIp,
+      400,
+      'Unexpected fields in request.',
+      'change-admin-code'
+    );
   }
 
   const expectedPassword = getAdminCodeChangePassword();
@@ -2689,11 +3490,25 @@ app.post('/api/auth/change-admin-code', (req, res) => {
   const { password, newAdminCode } = req.body;
 
   if (typeof password !== 'string' || password.length === 0 || password.length > 128) {
-    return res.status(400).json({ error: 'Please enter a valid authorization password.' });
+    return sendRateLimitedFailureResponse(
+      res,
+      adminCodeChangeRateLimiter,
+      clientIp,
+      400,
+      'Please enter a valid authorization password.',
+      'change-admin-code'
+    );
   }
 
   if (typeof newAdminCode !== 'string' || newAdminCode.length > 64) {
-    return res.status(400).json({ error: 'New Admin Code must be 4-64 non-whitespace characters.' });
+    return sendRateLimitedFailureResponse(
+      res,
+      adminCodeChangeRateLimiter,
+      clientIp,
+      400,
+      'New Admin Code must be 4-64 non-whitespace characters.',
+      'change-admin-code'
+    );
   }
 
   const normalizedNewCode = newAdminCode.trim().toUpperCase();
@@ -2702,16 +3517,45 @@ app.post('/api/auth/change-admin-code', (req, res) => {
     normalizedNewCode.length > 64 ||
     /[\x00-\x1F\x7F\s]/.test(normalizedNewCode)
   ) {
-    return res.status(400).json({
-      error: 'New Admin Code must be 4-64 characters with no spaces or control characters.',
-    });
+    return sendRateLimitedFailureResponse(
+      res,
+      adminCodeChangeRateLimiter,
+      clientIp,
+      400,
+      'New Admin Code must be 4-64 characters with no spaces or control characters.',
+      'change-admin-code'
+    );
   }
 
   if (!timingSafeCodeEqual(password, expectedPassword)) {
-    return res.status(401).json({ error: 'Incorrect password. Admin code was not changed.' });
+    return sendRateLimitedFailureResponse(
+      res,
+      adminCodeChangeRateLimiter,
+      clientIp,
+      401,
+      'Incorrect password. Admin code was not changed.',
+      'change-admin-code'
+    );
   }
 
-  db.updateAdminCode(normalizedNewCode);
+  if (!db.isDatabaseIntact()) {
+    return res.status(503).json({
+      error:
+        'Admin code cannot be updated because the persistent database is missing or corrupted. Run explicit initialization or recovery first.',
+      code: 'DB_UNAVAILABLE',
+    });
+  }
+
+  adminCodeChangeRateLimiter.reset(clientIp);
+  try {
+    db.updateAdminCode(normalizedNewCode);
+  } catch (err) {
+    console.error('Failed to persist updated admin code:', err);
+    return res.status(500).json({
+      error: 'Failed to persist updated admin code to database.',
+    });
+  }
+  invalidateAllAdminSessions('Admin code was changed. Please log in again.');
   return res.json({
     ok: true,
     message: 'Admin code updated successfully. Please log in with your new Admin Code.',

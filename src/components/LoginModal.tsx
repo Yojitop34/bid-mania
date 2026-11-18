@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { UserAuth, Team } from '../types';
-import { Shield, Users, KeyRound, AlertCircle, Trophy, Sparkles, Eye, EyeOff, CheckCircle2, ArrowLeft } from 'lucide-react';
+import { Shield, Users, KeyRound, AlertCircle, Trophy, Eye, EyeOff, CheckCircle2, ArrowLeft } from 'lucide-react';
 
 interface LoginModalProps {
   isOpen: boolean;
@@ -13,13 +13,11 @@ interface LoginModalProps {
 export default function LoginModal({
   isOpen,
   onLoginSuccess,
-  teams = [],
   onClose,
   allowClose = false,
 }: LoginModalProps) {
   const [roleMode, setRoleMode] = useState<'participant' | 'admin'>('participant');
-  const [modalTeams, setModalTeams] = useState<Team[]>(teams);
-  const [teamCode, setTeamCode] = useState<string>('TEAMA777');
+  const [teamCode, setTeamCode] = useState<string>('');
   const [adminCode, setAdminCode] = useState<string>('');
   const [showAdminCode, setShowAdminCode] = useState<boolean>(false);
   const [showChangeCode, setShowChangeCode] = useState<boolean>(false);
@@ -32,25 +30,63 @@ export default function LoginModal({
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
 
-  // Sync teams prop
-  useEffect(() => {
-    if (teams && teams.length > 0) {
-      setModalTeams(teams);
-    }
-  }, [teams]);
+  // Server-enforced cooldown countdown state (source of truth is server retryAfterSeconds)
+  const [loginCooldownUntilMs, setLoginCooldownUntilMs] = useState<number | null>(null);
+  const [loginCooldownSeconds, setLoginCooldownSeconds] = useState<number>(0);
+  const [loginCooldownPhase, setLoginCooldownPhase] = useState<'activated' | 'blocked' | null>(null);
 
-  // Fresh load on open to guarantee newest custom names and custom codes; reset transient sensitive state on close
+  const [changeCooldownUntilMs, setChangeCooldownUntilMs] = useState<number | null>(null);
+  const [changeCooldownSeconds, setChangeCooldownSeconds] = useState<number>(0);
+  const [changeCooldownPhase, setChangeCooldownPhase] = useState<'activated' | 'blocked' | null>(null);
+
   useEffect(() => {
-    if (isOpen) {
-      fetch('/api/state')
-        .then((res) => res.json())
-        .then((data) => {
-          if (data?.teams && Array.isArray(data.teams)) {
-            setModalTeams(data.teams);
-          }
-        })
-        .catch(() => {});
-    } else {
+    if (!loginCooldownUntilMs) {
+      setLoginCooldownSeconds(0);
+      setLoginCooldownPhase(null);
+      return;
+    }
+
+    const updateRemaining = () => {
+      const remaining = Math.max(0, Math.ceil((loginCooldownUntilMs - Date.now()) / 1000));
+      setLoginCooldownSeconds(remaining);
+      if (remaining <= 0) {
+        setLoginCooldownUntilMs(null);
+        setLoginCooldownPhase(null);
+      }
+    };
+
+    updateRemaining();
+    const interval = setInterval(updateRemaining, 250);
+    return () => clearInterval(interval);
+  }, [loginCooldownUntilMs]);
+
+  useEffect(() => {
+    if (!changeCooldownUntilMs) {
+      setChangeCooldownSeconds(0);
+      setChangeCooldownPhase(null);
+      return;
+    }
+
+    const updateRemaining = () => {
+      const remaining = Math.max(0, Math.ceil((changeCooldownUntilMs - Date.now()) / 1000));
+      setChangeCooldownSeconds(remaining);
+      if (remaining <= 0) {
+        setChangeCooldownUntilMs(null);
+        setChangeCooldownPhase(null);
+      }
+    };
+
+    updateRemaining();
+    const interval = setInterval(updateRemaining, 250);
+    return () => clearInterval(interval);
+  }, [changeCooldownUntilMs]);
+
+  // Reset transient sensitive state on close (preserve active cooldown timers)
+  useEffect(() => {
+    if (!isOpen) {
+      setTeamCode('');
+      setAdminCode('');
+      setError(null);
       setShowAdminCode(false);
       setShowChangeCode(false);
       setChangePassword('');
@@ -67,14 +103,16 @@ export default function LoginModal({
     e.preventDefault();
     setError(null);
 
-    if (roleMode === 'admin' && !adminCode.trim()) {
-      setError('Please enter your confidential Admin Access Code.');
-      return;
-    }
+    if (loginCooldownSeconds <= 0) {
+      if (roleMode === 'admin' && !adminCode.trim()) {
+        setError('Please enter your confidential Admin Access Code.');
+        return;
+      }
 
-    if (roleMode === 'participant' && !teamCode.trim()) {
-      setError('Please enter your Team Code (e.g. TEAMA777, TEAMB777, TEAMC777, TEAMD777).');
-      return;
+      if (roleMode === 'participant' && !teamCode.trim()) {
+        setError('Please enter your Team Code.');
+        return;
+      }
     }
 
     setLoading(true);
@@ -92,10 +130,25 @@ export default function LoginModal({
       });
 
       const data = await res.json();
+      if (
+        res.status === 429 ||
+        (typeof data?.retryAfterSeconds === 'number' && data.retryAfterSeconds > 0)
+      ) {
+        const seconds = Math.max(1, Math.ceil(Number(data?.retryAfterSeconds) || 30));
+        setLoginCooldownPhase(data?.cooldownActivated ? 'activated' : 'blocked');
+        setLoginCooldownSeconds(seconds);
+        setLoginCooldownUntilMs(Date.now() + seconds * 1000);
+        setError(null);
+        return;
+      }
+
       if (!res.ok) {
         throw new Error(data.error || 'Authentication failed');
       }
 
+      setLoginCooldownUntilMs(null);
+      setLoginCooldownSeconds(0);
+      setLoginCooldownPhase(null);
       onLoginSuccess({
         role: data.role,
         selectedTeam: data.selectedTeam,
@@ -109,29 +162,27 @@ export default function LoginModal({
     }
   };
 
-  const handleSelectTeamCode = (code: string) => {
-    setTeamCode(code);
-    setError(null);
-  };
 
   const handleSaveAdminCode = async () => {
     setChangeError(null);
     setChangeSuccess(null);
 
-    if (!changePassword) {
-      setChangeError('Please enter the authorization password.');
-      return;
-    }
-
     const trimmedNewCode = newAdminCode.trim();
-    if (!trimmedNewCode) {
-      setChangeError('Please enter a new Admin Code.');
-      return;
-    }
+    if (changeCooldownSeconds <= 0) {
+      if (!changePassword) {
+        setChangeError('Please enter the authorization password.');
+        return;
+      }
 
-    if (trimmedNewCode.length < 4 || trimmedNewCode.length > 64 || /\s/.test(trimmedNewCode)) {
-      setChangeError('New Admin Code must be 4-64 non-whitespace characters.');
-      return;
+      if (!trimmedNewCode) {
+        setChangeError('Please enter a new Admin Code.');
+        return;
+      }
+
+      if (trimmedNewCode.length < 4 || trimmedNewCode.length > 64 || /\s/.test(trimmedNewCode)) {
+        setChangeError('New Admin Code must be 4-64 non-whitespace characters.');
+        return;
+      }
     }
 
     setChangeLoading(true);
@@ -145,10 +196,25 @@ export default function LoginModal({
         }),
       });
       const data = await res.json();
+      if (
+        res.status === 429 ||
+        (typeof data?.retryAfterSeconds === 'number' && data.retryAfterSeconds > 0)
+      ) {
+        const seconds = Math.max(1, Math.ceil(Number(data?.retryAfterSeconds) || 30));
+        setChangeCooldownPhase(data?.cooldownActivated ? 'activated' : 'blocked');
+        setChangeCooldownSeconds(seconds);
+        setChangeCooldownUntilMs(Date.now() + seconds * 1000);
+        setChangeError(null);
+        return;
+      }
+
       if (!res.ok) {
         throw new Error(data.error || 'Failed to update admin code.');
       }
 
+      setChangeCooldownUntilMs(null);
+      setChangeCooldownSeconds(0);
+      setChangeCooldownPhase(null);
       setChangePassword('');
       setShowChangePassword(false);
       setNewAdminCode('');
@@ -159,6 +225,22 @@ export default function LoginModal({
       setChangeLoading(false);
     }
   };
+
+  const formatSecondsLabel = (n: number) => `${n} ${n === 1 ? 'second' : 'seconds'}`;
+
+  const activeLoginErrorMessage =
+    loginCooldownSeconds > 0
+      ? loginCooldownPhase === 'activated'
+        ? `Too many failed login attempts. Please wait ${formatSecondsLabel(loginCooldownSeconds)} before trying again.`
+        : `Login temporarily blocked. Please try again in ${formatSecondsLabel(loginCooldownSeconds)}.`
+      : error;
+
+  const activeChangeErrorMessage =
+    changeCooldownSeconds > 0
+      ? changeCooldownPhase === 'activated'
+        ? `Too many failed authorization attempts. Please wait ${formatSecondsLabel(changeCooldownSeconds)} before trying again.`
+        : `Authorization temporarily blocked. Please try again in ${formatSecondsLabel(changeCooldownSeconds)}.`
+      : changeError;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-in fade-in duration-150">
@@ -289,10 +371,10 @@ export default function LoginModal({
                 </div>
               </div>
 
-              {changeError && (
+              {activeChangeErrorMessage && (
                 <div className="bg-rose-50 border border-rose-200 text-rose-700 text-xs p-2.5 rounded-lg flex items-center gap-2">
                   <AlertCircle className="w-3.5 h-3.5 shrink-0 text-rose-600" />
-                  <span>{changeError}</span>
+                  <span>{activeChangeErrorMessage}</span>
                 </div>
               )}
 
@@ -333,77 +415,10 @@ export default function LoginModal({
                         required
                         value={teamCode}
                         onChange={(e) => setTeamCode(e.target.value.toUpperCase())}
-                        placeholder="e.g. TEAMA777"
+                        placeholder="Enter Team Code"
                         className="w-full px-3.5 py-2 text-sm font-mono font-bold tracking-wider bg-slate-50 border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 uppercase"
                       />
                       <KeyRound className="w-4 h-4 text-slate-400 absolute right-3 top-2.5" />
-                    </div>
-                  </div>
-
-                  {/* Quick Selection Buttons for 4 Teams */}
-                  <div>
-                    <div className="text-[11px] font-semibold text-slate-500 mb-1.5 flex items-center gap-1">
-                      <Sparkles className="w-3 h-3 text-blue-500" />
-                      <span>Select Team Code:</span>
-                    </div>
-                    <div className="grid grid-cols-2 gap-2">
-                      {[
-                        {
-                          id: 'team_a',
-                          code: 'Team A',
-                          defaultCode: 'TEAMA777',
-                          activeClass: 'bg-red-50 border-red-300 text-red-700 ring-2 ring-red-100',
-                        },
-                        {
-                          id: 'team_b',
-                          code: 'Team B',
-                          defaultCode: 'TEAMB777',
-                          activeClass: 'bg-blue-50 border-blue-300 text-blue-700 ring-2 ring-blue-100',
-                        },
-                        {
-                          id: 'team_c',
-                          code: 'Team C',
-                          defaultCode: 'TEAMC777',
-                          activeClass: 'bg-emerald-50 border-emerald-300 text-emerald-700 ring-2 ring-emerald-100',
-                        },
-                        {
-                          id: 'team_d',
-                          code: 'Team D',
-                          defaultCode: 'TEAMD777',
-                          activeClass: 'bg-amber-50 border-amber-300 text-amber-800 ring-2 ring-amber-100',
-                        },
-                      ].map((item) => {
-                        const foundTeam = modalTeams.find(
-                          (t) => t.id === item.id || t.code === item.code
-                        );
-                        const activeCode = (foundTeam?.loginCode || item.defaultCode).toUpperCase();
-                        // Exact user rule:
-                        // If custom name is set (e.g. "Claws" or "Winners"), show ONLY "Claws" or "Winners"!
-                        // If not set, show "Team B" or "Team A".
-                        const activeName =
-                          foundTeam?.name && foundTeam.name.trim()
-                            ? foundTeam.name.trim()
-                            : item.code;
-                        const isSelected = teamCode.trim().toUpperCase() === activeCode;
-
-                        return (
-                          <button
-                            key={item.id}
-                            type="button"
-                            onClick={() => handleSelectTeamCode(activeCode)}
-                            className={`px-3 py-2 text-xs font-bold rounded-lg border text-left transition cursor-pointer ${
-                              isSelected
-                                ? item.activeClass
-                                : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
-                            }`}
-                          >
-                            <div className="font-extrabold truncate text-xs">{activeName}</div>
-                            <div className="text-[10px] text-slate-500 font-mono mt-0.5 truncate">
-                              {activeCode}
-                            </div>
-                          </button>
-                        );
-                      })}
                     </div>
                   </div>
                 </div>
@@ -463,10 +478,10 @@ export default function LoginModal({
               )}
 
               {/* Error Message */}
-              {error && (
+              {activeLoginErrorMessage && (
                 <div className="bg-rose-50 border border-rose-200 text-rose-700 text-xs p-2.5 rounded-lg flex items-center gap-2">
                   <AlertCircle className="w-3.5 h-3.5 shrink-0 text-rose-600" />
-                  <span>{error}</span>
+                  <span>{activeLoginErrorMessage}</span>
                 </div>
               )}
 
@@ -486,7 +501,7 @@ export default function LoginModal({
                 ) : (
                   <>
                     <Trophy className="w-4 h-4" />
-                    <span>Enter as {teamCode.startsWith('TEAM') ? `Team ${teamCode.charAt(4)}` : 'Team Player'}</span>
+                    <span>Enter as Team Player</span>
                   </>
                 )}
               </button>
