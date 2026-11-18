@@ -1,19 +1,16 @@
+
 services:
   - type: web
     name: bid-mania
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm install --include=dev && npm run build
-    startCommand: npm start
-    disk:
-      name: bid-mania-data
-      mountPath: /var/data
-      sizeGB: 1
+    startCommand: npm run init-db; npm start
     envVars:
       - key: NODE_ENV
         value: production
       - key: DATA_DIR
-        value: /var/data
+        value: /tmp
       - key: TRUST_PROXY
         value: "true"
       - key: ADMIN_DEFAULT_CODE
