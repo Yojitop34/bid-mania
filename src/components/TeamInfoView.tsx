@@ -50,7 +50,13 @@ export default function TeamInfoView({
       },
       cache: 'no-store',
     })
-      .then((res) => (res.ok ? res.json() : null))
+      .then(async (res) => {
+        if (!res.ok) return null;
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) return null;
+        const text = await res.text();
+        return text ? JSON.parse(text) : null;
+      })
       .then((data) => {
         if (cancelled || !data?.teamCodes || !Array.isArray(data.teamCodes)) return;
         const map: Record<string, string> = {};
@@ -193,8 +199,8 @@ export default function TeamInfoView({
 
                       {/* Initial Budget & Purse Left */}
                       <div className="text-[11px] text-slate-500 mt-0.5">
-                        Initial Budget: <strong>{team.baseBudget} M$</strong> • Purse Left:{' '}
-                        <strong className="text-blue-600">{team.remainingBudget} M$</strong>
+                        Initial Budget: <strong>{team.baseBudget} Cr</strong> • Purse Left:{' '}
+                        <strong className="text-blue-600">{team.remainingBudget} Cr</strong>
                       </div>
 
                       {/* Feature 1a: Squad count pill placed directly below budget line without extra text */}

@@ -105,12 +105,12 @@ export default function Header({
     setPurseError(null);
     const val = parseInt(allPurseValue.trim(), 10);
     if (isNaN(val) || val < 0) {
-      setPurseError('Please enter a valid non-negative purse amount in M$ (e.g. 800).');
+      setPurseError('Please enter a valid non-negative purse amount in Cr (e.g. 800).');
       return;
     }
     if (onUpdatePurse) {
       onUpdatePurse('all', val);
-      setSavedSuccess(`All team remaining purses updated to ${val} M$ successfully!`);
+      setSavedSuccess(`All team remaining purses updated to ${val} Cr successfully!`);
       setTimeout(() => setSavedSuccess(null), 2500);
     }
   };
@@ -127,7 +127,7 @@ export default function Header({
     }
     if (onUpdatePurse) {
       onUpdatePurse(teamId, val);
-      setSavedSuccess(`Updated remaining purse for ${teamDisplay} to ${val} M$!`);
+      setSavedSuccess(`Updated remaining purse for ${teamDisplay} to ${val} Cr!`);
       setTimeout(() => setSavedSuccess(null), 2000);
     }
   };
@@ -406,7 +406,7 @@ export default function Header({
                     type="button"
                     onClick={() => handleStepAllPurse(-50)}
                     className="w-9 h-9 flex items-center justify-center bg-white hover:bg-slate-100 active:scale-95 border border-slate-300 rounded-lg text-slate-700 font-bold text-sm transition cursor-pointer"
-                    title="Decrease by 50 M$"
+                    title="Decrease by 50 Cr"
                   >
                     -
                   </button>
@@ -420,14 +420,14 @@ export default function Header({
                       className="w-full min-w-0 p-0 bg-transparent text-sm text-right font-semibold leading-normal focus:outline-hidden [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                     />
                     <span className="ml-1 text-xs font-bold text-slate-400 leading-normal shrink-0 select-none">
-                      M$
+                      Cr
                     </span>
                   </div>
                   <button
                     type="button"
                     onClick={() => handleStepAllPurse(50)}
                     className="w-9 h-9 flex items-center justify-center bg-white hover:bg-slate-100 active:scale-95 border border-slate-300 rounded-lg text-slate-700 font-bold text-sm transition cursor-pointer"
-                    title="Increase by 50 M$"
+                    title="Increase by 50 Cr"
                   >
                     +
                   </button>
@@ -464,7 +464,7 @@ export default function Header({
                         </div>
                         {t.totalSpent > 0 && (
                           <div className="text-[10px] text-slate-400">
-                            Spent: {t.totalSpent} M$
+                            Spent: {t.totalSpent} Cr
                           </div>
                         )}
                       </div>
@@ -475,7 +475,7 @@ export default function Header({
                         type="button"
                         onClick={() => handleStepSinglePurse(t.id, t.remainingBudget, -50)}
                         className="w-7 h-7 flex items-center justify-center bg-slate-50 hover:bg-slate-100 active:scale-95 border border-slate-300 rounded-md text-slate-700 font-bold text-sm transition cursor-pointer"
-                        title="Decrease by 50 M$"
+                        title="Decrease by 50 Cr"
                       >
                         -
                       </button>
@@ -493,14 +493,14 @@ export default function Header({
                           className="w-full min-w-0 p-0 bg-transparent text-xs text-right font-semibold leading-normal focus:outline-hidden [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                         />
                         <span className="ml-1 text-[11px] font-bold text-slate-400 leading-normal shrink-0 select-none">
-                          M$
+                          Cr
                         </span>
                       </div>
                       <button
                         type="button"
                         onClick={() => handleStepSinglePurse(t.id, t.remainingBudget, 50)}
                         className="w-7 h-7 flex items-center justify-center bg-slate-50 hover:bg-slate-100 active:scale-95 border border-slate-300 rounded-md text-slate-700 font-bold text-sm transition cursor-pointer"
-                        title="Increase by 50 M$"
+                        title="Increase by 50 Cr"
                       >
                         +
                       </button>

@@ -87,8 +87,15 @@ export default function App() {
   // Initial state fetch via REST
   useEffect(() => {
     fetch('/api/state')
-      .then((res) => res.json())
+      .then(async (res) => {
+        if (!res.ok) return null;
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) return null;
+        const text = await res.text();
+        return text ? JSON.parse(text) : null;
+      })
       .then((data) => {
+        if (!data) return;
         setDbState(data);
         if (data.activeAuction?.status === 'bidding') {
           setIsArenaActive(true);
@@ -365,11 +372,17 @@ export default function App() {
         },
         body: JSON.stringify({ teamId, code }),
       });
-      const data = await res.json();
+      const text = await res.text();
+      let data: any = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        return { ok: false, error: 'Server returned an unexpected response. Please try again.' };
+      }
       if (!res.ok) {
         return { ok: false, error: data?.error || 'Failed to update team code.' };
       }
-      return { ok: true, loginCode: data.loginCode };
+      return { ok: true, loginCode: data?.loginCode };
     } catch {
       return { ok: false, error: 'Network error while updating team code.' };
     }
@@ -483,7 +496,7 @@ export default function App() {
                       <span className="text-slate-400 ml-2">(Physical Bidding)</span>
                     ) : dbState.activeAuction.currentBid ? (
                       <span className="text-blue-400 font-semibold ml-2">
-                        ({dbState.activeAuction.currentTeam} leads at {dbState.activeAuction.currentBid} M$)
+                        ({dbState.activeAuction.currentTeam} leads at {dbState.activeAuction.currentBid} Cr)
                       </span>
                     ) : (
                       <span className="text-slate-400 ml-2">

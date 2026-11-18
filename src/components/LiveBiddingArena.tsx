@@ -159,10 +159,10 @@ export default function LiveBiddingArena({
 
     if (numAmount < minValidBid) {
       if (isFirstBid) {
-        setLocalError(`First bid must be at least the base price of ${minValidBid} M$.`);
+        setLocalError(`First bid must be at least the base price of ${minValidBid} Cr.`);
       } else {
         setLocalError(
-          `Bid must be at least ${minValidBid} M$ (Current bid + 20 M$ increment).`
+          `Bid must be at least ${minValidBid} Cr (Current bid + 20 Cr increment).`
         );
       }
       return;
@@ -170,7 +170,7 @@ export default function LiveBiddingArena({
 
     if (numAmount > currentTeamPurse) {
       setLocalError(
-        `Insufficient purse! ${assignedTeam} only has ${currentTeamPurse} M$ remaining.`
+        `Insufficient purse! ${assignedTeam} only has ${currentTeamPurse} Cr remaining.`
       );
       return;
     }
@@ -198,14 +198,14 @@ export default function LiveBiddingArena({
 
     const numAmount = Number(offlinePriceInput.trim());
     if (!hasPrice || isNaN(numAmount) || numAmount <= 0) {
-      setLocalError('Please enter a valid price in millions (M$), or clear the team to mark as unsold.');
+      setLocalError('Please enter a valid price in Crores (Cr), or clear the team to mark as unsold.');
       return;
     }
 
     const minBase = player?.basePrice || 0;
     if (numAmount < minBase) {
       setLocalError(
-        `Please enter an amount equal to or higher than the Base price of ${minBase} M$`
+        `Please enter an amount equal to or higher than the Base price of ${minBase} Cr`
       );
       return;
     }
@@ -215,7 +215,7 @@ export default function LiveBiddingArena({
       const displayName =
         chosenTeam.name && chosenTeam.name.trim() ? chosenTeam.name.trim() : chosenTeam.code;
       setLocalError(
-        `Insufficient purse! ${displayName} only has ${chosenTeam.remainingBudget} M$ remaining.`
+        `Insufficient purse! ${displayName} only has ${chosenTeam.remainingBudget} Cr remaining.`
       );
       return;
     }
@@ -359,7 +359,7 @@ export default function LiveBiddingArena({
                   })()}
                 </span>{' '}
                 for{' '}
-                <span className="font-extrabold text-emerald-700 text-lg">{activeAuction.currentBid} M$</span>
+                <span className="font-extrabold text-emerald-700 text-lg">{activeAuction.currentBid} Cr</span>
               </p>
               <p className="text-[11px] text-emerald-700 mt-1">
                 Team purse deducted and player assigned to team roster in database.
@@ -441,7 +441,7 @@ export default function LiveBiddingArena({
                     <>
                       <div className="text-2xl sm:text-3xl font-extrabold text-blue-600 tracking-tight my-0.5 sm:my-1">
                         {activeAuction.currentBid}{' '}
-                        <span className="text-base font-bold text-slate-600">M$</span>
+                        <span className="text-base font-bold text-slate-600">Cr</span>
                       </div>
                       <div className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full text-xs font-bold bg-blue-50 text-blue-800 border border-blue-200">
                         <span>
@@ -465,7 +465,7 @@ export default function LiveBiddingArena({
                         No Bids Yet
                       </div>
                       <div className="text-xs font-semibold text-blue-700 bg-blue-50 px-3 py-0.5 rounded-full inline-block">
-                        Base Price: {player?.basePrice} M$
+                        Base Price: {player?.basePrice} Cr
                       </div>
                     </>
                   )}
@@ -519,7 +519,7 @@ export default function LiveBiddingArena({
                         {player?.valuePoints} pts
                       </span>
                       <span className="px-2 py-0.5 rounded text-[10px] sm:text-[11px] font-bold bg-blue-600 text-white shadow-2xs">
-                        {player?.basePrice} M$
+                        {player?.basePrice} Cr
                       </span>
                     </div>
                   </div>
@@ -559,7 +559,7 @@ export default function LiveBiddingArena({
                     <div className="bg-white p-2 rounded-lg border border-slate-200 shadow-2xs">
                       <div className="text-[10px] text-slate-500 font-medium">Leading Amount:</div>
                       <div className="text-xs sm:text-sm font-bold text-blue-600 mt-0.5">
-                        {activeAuction.currentBid !== null ? `${activeAuction.currentBid} M$` : 'Awaiting 1st bid'}
+                        {activeAuction.currentBid !== null ? `${activeAuction.currentBid} Cr` : 'Awaiting 1st bid'}
                       </div>
                     </div>
                   </div>
@@ -580,7 +580,7 @@ export default function LiveBiddingArena({
                     <div className="text-xs text-slate-600">
                       Available Purse:{' '}
                       <strong className="text-blue-600 font-extrabold text-xs sm:text-sm">
-                        {currentTeamPurse} M$
+                        {currentTeamPurse} Cr
                       </strong>
                     </div>
                   </div>
@@ -588,10 +588,10 @@ export default function LiveBiddingArena({
                   <div>
                     <div className="flex justify-between items-center mb-1">
                       <label className="text-[11px] font-bold text-slate-700">
-                        Bid Amount (Millions M$):
+                        Bid Amount (Cr):
                       </label>
                       <span className="text-[10px] text-slate-500">
-                        Min: <strong>{minValidBid} M$</strong>
+                        Min: <strong>{minValidBid} Cr</strong>
                       </span>
                     </div>
 
@@ -607,10 +607,10 @@ export default function LiveBiddingArena({
                           onClearError();
                         }}
                         placeholder={`e.g. ${minValidBid}`}
-                        className="w-full px-3 py-1.5 text-sm font-bold bg-white border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                        className="w-full px-3 py-1.5 text-sm font-bold bg-white border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                       />
                       <span className="absolute right-3 top-1.5 text-xs font-bold text-slate-400">
-                        M$
+                        Cr
                       </span>
                     </div>
 
@@ -620,7 +620,7 @@ export default function LiveBiddingArena({
                         onClick={() => handleQuickAmount(minValidBid)}
                         className="px-2 py-0.5 text-[10px] font-semibold rounded bg-slate-200/80 hover:bg-slate-300 text-slate-800 transition cursor-pointer"
                       >
-                        Min: {minValidBid} M$
+                        Min: {minValidBid} Cr
                       </button>
                       {!isFirstBid && (
                         <>
@@ -629,14 +629,14 @@ export default function LiveBiddingArena({
                             onClick={() => handleQuickAmount(minValidBid + 20)}
                             className="px-2 py-0.5 text-[10px] font-semibold rounded bg-blue-100 hover:bg-blue-200 text-blue-800 transition cursor-pointer"
                           >
-                            +{20} M$ ({minValidBid + 20} M$)
+                            +{20} Cr ({minValidBid + 20} Cr)
                           </button>
                           <button
                             type="button"
                             onClick={() => handleQuickAmount(minValidBid + 50)}
                             className="px-2 py-0.5 text-[10px] font-semibold rounded bg-blue-100 hover:bg-blue-200 text-blue-800 transition cursor-pointer"
                           >
-                            +{50} M$ ({minValidBid + 50} M$)
+                            +{50} Cr ({minValidBid + 50} Cr)
                           </button>
                         </>
                       )}
@@ -680,7 +680,7 @@ export default function LiveBiddingArena({
                           className="flex items-center justify-between p-1.5 rounded bg-slate-50 border border-slate-100 text-[11px]"
                         >
                           <span className="font-bold text-slate-900">{item.teamCode}</span>
-                          <span className="font-extrabold text-blue-600">{item.amount} M$</span>
+                          <span className="font-extrabold text-blue-600">{item.amount} Cr</span>
                           <span className="text-[9px] text-slate-400">{item.timestamp}</span>
                         </div>
                       ))}
@@ -738,11 +738,11 @@ export default function LiveBiddingArena({
                           setLocalError(null);
                           onClearError();
                         }}
-                        placeholder="Enter price in M$ (e.g. 80)"
+                        placeholder="Enter price in Cr (e.g. 80)"
                         className="w-full px-3 py-2 pr-12 text-sm font-bold bg-white border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 text-slate-900"
                       />
                       <span className="absolute right-3 top-2.5 text-xs font-bold text-slate-400">
-                        M$
+                        Cr
                       </span>
                     </div>
                   </div>
@@ -789,7 +789,7 @@ export default function LiveBiddingArena({
                   <div className="py-3 flex items-center justify-between gap-3">
                     <span className="text-xs font-bold text-slate-950">Base Price :</span>
                     <span className="text-sm font-extrabold text-blue-600">
-                      {player?.basePrice} M$
+                      {player?.basePrice} Cr
                     </span>
                   </div>
                 </div>
@@ -991,7 +991,7 @@ export default function LiveBiddingArena({
                   </div>
                   <div className="text-right">
                     <div className="text-xs font-extrabold text-blue-600">
-                      {team.remainingBudget} M$
+                      {team.remainingBudget} Cr
                     </div>
                     <div className="text-[8px] text-slate-400">Purse Left</div>
                   </div>
@@ -1019,7 +1019,7 @@ export default function LiveBiddingArena({
                       ✓ QUALIFIED
                     </div>
                     <div className="text-[10px] text-emerald-800 font-semibold mt-0.5">
-                      {teamPlayers.length}/8 Players • {team.remainingBudget} M$
+                      {teamPlayers.length}/8 Players • {team.remainingBudget} Cr
                     </div>
                     <div className="text-[8px] text-emerald-600 mt-0.5 italic">
                       Can bid aggressively or drive up prices

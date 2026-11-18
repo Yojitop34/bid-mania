@@ -109,13 +109,13 @@ export default function ScoreboardView({ teams, players }: ScoreboardViewProps) 
                       {team.totalValue.toLocaleString()}
                     </td>
                     <td className="py-3.5 px-4 text-center font-bold text-slate-600">
-                      {team.totalSpent} M$
+                      {team.totalSpent} Cr
                     </td>
                     <td className="py-3.5 px-4 text-center font-bold text-slate-900">
-                      {team.baseBudget} M$
+                      {team.baseBudget} Cr
                     </td>
                     <td className="py-3.5 px-4 text-center font-extrabold text-blue-600">
-                      {team.remainingBudget} M$
+                      {team.remainingBudget} Cr
                     </td>
                     <td className="py-3.5 px-4 text-center">
                       {team.isQualified ? (
@@ -187,7 +187,7 @@ export default function ScoreboardView({ teams, players }: ScoreboardViewProps) 
                         )}
                       </div>
                       <div className="text-xs text-slate-500 mt-0.5">
-                        {total} players • {team.totalSpent} M$ spent on auctions • {team.remainingBudget} M$ remaining
+                        {total} players • {team.totalSpent} Cr spent on auctions • {team.remainingBudget} Cr remaining
                       </div>
                     </div>
                   </div>
@@ -350,13 +350,13 @@ export default function ScoreboardView({ teams, players }: ScoreboardViewProps) 
                       </div>
                       <div className="bg-white rounded-lg p-3 text-center border border-slate-200 shadow-2xs">
                         <div className="text-lg font-bold text-slate-700 mb-0.5">
-                          {team.totalSpent} M$
+                          {team.totalSpent} Cr
                         </div>
                         <div className="text-[10px] text-slate-500 font-medium">Total Spent</div>
                       </div>
                       <div className="bg-white rounded-lg p-3 text-center border border-slate-200 shadow-2xs">
                         <div className="text-lg font-bold text-slate-900 mb-0.5">
-                          {team.baseBudget} M$
+                          {team.baseBudget} Cr
                         </div>
                         <div className="text-[10px] text-slate-500 font-medium">Initial Budget</div>
                       </div>
@@ -371,11 +371,11 @@ export default function ScoreboardView({ teams, players }: ScoreboardViewProps) 
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-y-1.5 text-xs">
                         <div className="flex justify-between sm:pr-6 text-slate-600">
                           <span>Initial Budget:</span>
-                          <span className="font-bold text-slate-900">{team.baseBudget} M$</span>
+                          <span className="font-bold text-slate-900">{team.baseBudget} Cr</span>
                         </div>
                         <div className="flex justify-between text-slate-600">
                           <span>Spent on Auctions:</span>
-                          <span className="font-bold text-slate-800">{team.totalSpent} M$</span>
+                          <span className="font-bold text-slate-800">{team.totalSpent} Cr</span>
                         </div>
                         <div className="flex justify-between sm:pr-6 text-slate-600 pt-1 border-t border-slate-100">
                           <span>Squad Total Points:</span>
@@ -383,7 +383,7 @@ export default function ScoreboardView({ teams, players }: ScoreboardViewProps) 
                         </div>
                         <div className="flex justify-between text-slate-600 pt-1 border-t border-slate-100">
                           <span className="font-bold text-slate-800">Remaining Budget:</span>
-                          <span className="font-extrabold text-blue-600">{team.remainingBudget} M$</span>
+                          <span className="font-extrabold text-blue-600">{team.remainingBudget} Cr</span>
                         </div>
                       </div>
                     </div>
@@ -424,7 +424,7 @@ export default function ScoreboardView({ teams, players }: ScoreboardViewProps) 
                                 {player.valuePoints}
                               </td>
                               <td className="py-2.5 px-3 text-center text-slate-700 font-medium">
-                                {player.soldCost !== null ? `${player.soldCost} M$` : '0 M$'}
+                                {player.soldCost !== null ? `${player.soldCost} Cr` : '0 Cr'}
                               </td>
                             </tr>
                           ))}

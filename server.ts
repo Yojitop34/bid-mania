@@ -1333,13 +1333,13 @@ class AuctionDatabase {
       }
       const amount = Number(offlineAward.amount);
       if (isNaN(amount) || amount <= 0) {
-        throw new Error('Please enter a valid price in M$ before ending offline bidding.');
+        throw new Error('Please enter a valid price in Cr before ending offline bidding.');
       }
       const player = this.state.players.find((p) => p.id === auction.playerId);
       if (!player) throw new Error('Player not found');
       if (amount < player.basePrice) {
         throw new Error(
-          `Please enter an amount equal to or higher than the Base price of ${player.basePrice} M$`
+          `Please enter an amount equal to or higher than the Base price of ${player.basePrice} Cr`
         );
       }
 
@@ -1356,7 +1356,7 @@ class AuctionDatabase {
       if (amount > team.remainingBudget) {
         const displayName = team.name && team.name.trim() ? team.name.trim() : team.code;
         throw new Error(
-          `Insufficient purse! ${displayName} has ${team.remainingBudget} M$ remaining, but entered price is ${amount} M$.`
+          `Insufficient purse! ${displayName} has ${team.remainingBudget} Cr remaining, but entered price is ${amount} Cr.`
         );
       }
 
@@ -1395,7 +1395,7 @@ class AuctionDatabase {
     // Check remaining purse
     if (bidAmount > team.remainingBudget) {
       throw new Error(
-        `Insufficient purse! ${team.code} has ${team.remainingBudget} M$ remaining, but bid is ${bidAmount} M$.`
+        `Insufficient purse! ${team.code} has ${team.remainingBudget} Cr remaining, but bid is ${bidAmount} Cr.`
       );
     }
 
@@ -1403,7 +1403,7 @@ class AuctionDatabase {
     if (auction.currentBid === null) {
       if (bidAmount < player.basePrice) {
         throw new Error(
-          `Bid must be at least the base price of ${player.basePrice} M$.`
+          `Bid must be at least the base price of ${player.basePrice} Cr.`
         );
       }
     } else {
@@ -1411,7 +1411,7 @@ class AuctionDatabase {
       const minBid = auction.currentBid + 20;
       if (bidAmount < minBid) {
         throw new Error(
-          `Counter bid must be at least ${minBid} M$ (Current bid ${auction.currentBid} M$ + 20 M$ minimum increment).`
+          `Counter bid must be at least ${minBid} Cr (Current bid ${auction.currentBid} Cr + 20 Cr minimum increment).`
         );
       }
     }
@@ -2842,7 +2842,7 @@ wss.on('connection', (ws, req) => {
           type: 'BID_PLACED',
           auction: result.auction,
           state: publicState(),
-          message: `${session.teamCode} placed a bid of ${data.amount} M$!`,
+          message: `${session.teamCode} placed a bid of ${data.amount} Cr!`,
         });
       } else if (data.type === 'START_BID') {
         if (!hasOnlyAllowedKeys(data, ['type', 'playerId', 'durationSeconds', 'biddingType'])) {

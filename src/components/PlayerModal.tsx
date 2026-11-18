@@ -94,7 +94,7 @@ export default function PlayerModal({
 
           <div className="bg-slate-50 rounded-xl p-3.5 border border-slate-200/80">
             <div className="text-xl font-bold text-blue-600 mb-0.5">
-              {player.basePrice} M$
+              {player.basePrice} Cr
             </div>
             <div className="text-[11px] text-slate-500 font-medium">Base Price</div>
           </div>
@@ -109,7 +109,7 @@ export default function PlayerModal({
                 <span>Player Acquired</span>
               </div>
               <div className="text-xs">
-                Sold for <strong>{player.soldCost} M$</strong> to{' '}
+                Sold for <strong>{player.soldCost} Cr</strong> to{' '}
                 <span className="font-bold text-emerald-900">
                   {player.teamId ? player.teamId.replace('_', ' ').toUpperCase() : ''}
                 </span>

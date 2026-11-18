@@ -81,7 +81,7 @@ export default function PlayerDisplayView({
                       onClick={() => onSelectPlayer(player)}
                       className={`group relative bg-white rounded-xl overflow-hidden shadow-xs hover:shadow-md transition-all duration-200 border ${
                         isUnderAuction
-                          ? 'ring-2 ring-blue-600 border-blue-600'
+                          ? 'border-blue-400'
                           : player.isSold
                           ? 'border-slate-200 opacity-80'
                           : 'border-slate-200/90 hover:border-blue-400'
@@ -115,7 +115,7 @@ export default function PlayerDisplayView({
                               SOLD
                             </span>
                             <span className="text-amber-300 font-bold text-[10px] sm:text-xs mt-0.5">
-                              {player.soldCost} M$
+                              {player.soldCost} Cr
                             </span>
                             <span className="text-slate-200 text-[8px] sm:text-[10px] font-medium mt-0.5 uppercase truncate max-w-full px-1">
                               {player.teamId?.replace('_', ' ')}
@@ -141,7 +141,7 @@ export default function PlayerDisplayView({
                               {player.valuePoints} pts
                             </span>
                             <span className="px-1 sm:px-1.5 py-0.5 rounded text-[8px] sm:text-[10px] font-semibold bg-blue-600 text-white">
-                              {player.basePrice} M$
+                              {player.basePrice} Cr
                             </span>
                           </div>
                         </div>

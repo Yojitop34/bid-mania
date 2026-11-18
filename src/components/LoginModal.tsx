@@ -10,6 +10,18 @@ interface LoginModalProps {
   allowClose?: boolean;
 }
 
+async function parseJsonResponse(res: Response): Promise<any> {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(
+      'Server is temporarily unavailable or returned an unexpected response. Please try again.'
+    );
+  }
+}
+
 export default function LoginModal({
   isOpen,
   onLoginSuccess,
@@ -129,7 +141,7 @@ export default function LoginModal({
         body: JSON.stringify(payload),
       });
 
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
       if (
         res.status === 429 ||
         (typeof data?.retryAfterSeconds === 'number' && data.retryAfterSeconds > 0)
@@ -195,7 +207,7 @@ export default function LoginModal({
           newAdminCode: trimmedNewCode,
         }),
       });
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
       if (
         res.status === 429 ||
         (typeof data?.retryAfterSeconds === 'number' && data.retryAfterSeconds > 0)
