@@ -4,9 +4,23 @@ import net from 'net';
 import { WebSocketServer, WebSocket } from 'ws';
 import crypto from 'crypto';
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import {
+  type DatabaseStatus,
+  getDefaultAdminCode,
+  isValidAdminCodeFormat,
+  hashAdminCode,
+  isValidAdminCodeHashFormat,
+  verifyAdminCodeHash,
+  resolveDatabasePaths,
+  initializeOrLoadDatabase,
+  saveDatabaseWithBackup,
+  cliInitDatabase,
+  cliRecoverAdmin,
+} from './dbManager.ts';
+
+export type { DatabaseStatus };
 
 if (process.env.NODE_ENV !== 'production') {
   dotenv.config();
@@ -80,155 +94,15 @@ export interface DatabaseState {
   auditLogs: { id: string; action: string; timestamp: string; details: any }[];
 }
 
-function getDefaultAdminCode(): string | null {
-  const raw = process.env.ADMIN_DEFAULT_CODE;
-  if (typeof raw !== 'string') return null;
-  const normalized = raw.trim().toUpperCase();
-  return normalized.length > 0 ? normalized : null;
-}
-
 function getAdminCodeChangePassword(): string | null {
   const raw = process.env.ADMIN_CODE_CHANGE_PASSWORD;
   if (typeof raw !== 'string' || raw.length === 0) return null;
   return raw;
 }
 
-function isValidAdminCodeFormat(normalizedCode: string): boolean {
-  return (
-    normalizedCode.length >= 4 &&
-    normalizedCode.length <= 64 &&
-    !/[\x00-\x1F\x7F\s]/.test(normalizedCode)
-  );
-}
-
-function hashAdminCode(normalizedCode: string): string {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(normalizedCode, salt, 64).toString('hex');
-  return `scrypt:${salt}:${derived}`;
-}
-
-function isValidAdminCodeHashFormat(storedHash: unknown): storedHash is string {
-  if (typeof storedHash !== 'string') return false;
-  const parts = storedHash.split(':');
-  return (
-    parts.length === 3 &&
-    parts[0] === 'scrypt' &&
-    /^[0-9a-f]{32}$/i.test(parts[1]) &&
-    /^[0-9a-f]{128}$/i.test(parts[2])
-  );
-}
-
-function verifyAdminCodeHash(normalizedCode: string, storedHash: unknown): boolean {
-  if (!isValidAdminCodeHashFormat(storedHash)) return false;
-  const [, salt, hexHash] = storedHash.split(':');
-  const expectedBuf = Buffer.from(hexHash, 'hex');
-  const actualBuf = crypto.scryptSync(normalizedCode, salt, 64);
-  if (actualBuf.length !== expectedBuf.length) return false;
-  return crypto.timingSafeEqual(actualBuf, expectedBuf);
-}
-
-function isRenderEnvironment(): boolean {
-  return (
-    process.env.RENDER === 'true' ||
-    process.env.RENDER === '1' ||
-    Boolean(process.env.RENDER_SERVICE_ID)
-  );
-}
-
-function validateRenderPersistentDir(targetDir: string) {
-  if (!fs.existsSync(targetDir)) {
-    throw new Error(
-      `FATAL: Persistent disk directory "${targetDir}" does not exist on Render. Refusing to fall back to a temporary filesystem.`
-    );
-  }
-  let stat: fs.Stats;
-  try {
-    stat = fs.statSync(targetDir);
-  } catch (err: any) {
-    throw new Error(
-      `FATAL: Unable to inspect persistent disk directory "${targetDir}": ${err?.message || err}`
-    );
-  }
-  if (!stat.isDirectory()) {
-    throw new Error(
-      `FATAL: Persistent disk path "${targetDir}" is not a directory. Refusing to fall back to a temporary filesystem.`
-    );
-  }
-  try {
-    fs.accessSync(targetDir, fs.constants.R_OK | fs.constants.W_OK);
-  } catch (err: any) {
-    throw new Error(
-      `FATAL: Persistent disk directory "${targetDir}" is not readable and writable: ${err?.message || err}`
-    );
-  }
-}
-
-function resolveDatabasePaths(): { dataDir: string; dbFile: string } {
-  const rawDbPath = (process.env.DATABASE_PATH || process.env.DB_FILE_PATH || '').trim();
-  const rawDataDir = (process.env.DATA_DIR || process.env.RENDER_DISK_PATH || '').trim();
-  const onRender = isRenderEnvironment();
-
-  let dataDir: string;
-  let dbFile: string;
-
-  if (rawDbPath) {
-    dbFile = path.resolve(rawDbPath);
-    dataDir = path.dirname(dbFile);
-  } else if (rawDataDir) {
-    dataDir = path.resolve(rawDataDir);
-    dbFile = path.join(dataDir, 'auction_database.json');
-  } else {
-    if (onRender) {
-      throw new Error(
-        'FATAL: Persistent storage is required on Render. Set DATA_DIR (e.g. /var/data) or DATABASE_PATH pointing to your mounted Render persistent disk. Refusing to fall back to a temporary filesystem.'
-      );
-    }
-    dataDir = path.join(__dirname, 'data');
-    dbFile = path.join(dataDir, 'auction_database.json');
-  }
-
-  if (onRender) {
-    const resolvedAppRoot = path.resolve(__dirname);
-    const relativeToApp = path.relative(resolvedAppRoot, dbFile);
-    const isInsideAppRoot =
-      relativeToApp === '' ||
-      (!relativeToApp.startsWith('..') && !path.isAbsolute(relativeToApp));
-    if (isInsideAppRoot) {
-      throw new Error(
-        `FATAL: Database path "${dbFile}" points inside the ephemeral application directory "${resolvedAppRoot}" on Render. Configure DATA_DIR to your mounted persistent disk (e.g. /var/data).`
-      );
-    }
-    validateRenderPersistentDir(dataDir);
-  }
-
-  return { dataDir, dbFile };
-}
-
-const { dataDir: DATA_DIR, dbFile: DB_FILE } = resolveDatabasePaths();
-
-function writeDatabaseStateAtomically(filePath: string, state: DatabaseState) {
-  const dir = path.dirname(filePath);
-  const tmpPath = path.join(
-    dir,
-    `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
-  );
-  try {
-    fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2), {
-      encoding: 'utf-8',
-      mode: 0o600,
-    });
-    fs.renameSync(tmpPath, filePath);
-  } catch (err) {
-    try {
-      if (fs.existsSync(tmpPath)) {
-        fs.unlinkSync(tmpPath);
-      }
-    } catch {
-      // ignore temp cleanup failure
-    }
-    throw err;
-  }
-}
+const DB_PATHS = resolveDatabasePaths(__dirname);
+const DATA_DIR = DB_PATHS.dataDir;
+const DB_FILE = DB_PATHS.dbFile;
 
 // Constant Fixed Starting Teams and Players as specified
 function getInitialTeams(): Team[] {
@@ -803,7 +677,7 @@ export function calculateQualification(teamId: string, players: Player[]) {
 }
 
 function buildSeededDatabaseState(adminCodeHash?: string): DatabaseState {
-  return {
+  const state: DatabaseState = {
     config: {
       gameCode: 'APL2026',
       ...(adminCodeHash ? { adminCodeHash } : {}),
@@ -832,22 +706,20 @@ function buildSeededDatabaseState(adminCodeHash?: string): DatabaseState {
       },
     ],
   };
-}
 
-function isValidPersistedDatabaseShape(candidate: unknown): candidate is DatabaseState {
-  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
-    return false;
+  for (const team of state.teams) {
+    const teamPlayers = state.players.filter((p) => p.teamId === team.id);
+    const auctionSpent = teamPlayers
+      .filter((p) => p.type === 'Auction')
+      .reduce((sum, p) => sum + (p.soldCost || 0), 0);
+    team.totalSpent = auctionSpent;
+    const effectiveBudget = team.adjustedBudget ?? team.baseBudget;
+    team.remainingBudget = Math.max(0, effectiveBudget - auctionSpent);
+    team.totalValue = teamPlayers.reduce((sum, p) => sum + p.valuePoints, 0);
+    team.isQualified = calculateQualification(team.id, state.players).isQualified;
   }
-  const obj = candidate as Record<string, unknown>;
-  return (
-    Array.isArray(obj.teams) &&
-    obj.teams.length > 0 &&
-    Array.isArray(obj.players) &&
-    obj.players.length > 0 &&
-    Boolean(obj.activeAuction) &&
-    typeof obj.activeAuction === 'object' &&
-    !Array.isArray(obj.activeAuction)
-  );
+
+  return state;
 }
 
 function parseCliFlags(argv: string[]): {
@@ -877,120 +749,12 @@ function parseCliFlags(argv: string[]): {
   return { command, code, useDefault };
 }
 
-function runCliInitDb(): never {
-  if (fs.existsSync(DB_FILE)) {
-    console.error(
-      `REFUSED: Persistent database already exists at ${DB_FILE}. First-time initialization will never overwrite an active database or Admin Code. Use "npm run recover-admin -- --code <NEW_CODE>" if you need to recover Admin access.`
-    );
-    process.exit(1);
-  }
-
-  const defaultAdminCode = getDefaultAdminCode();
-  if (!defaultAdminCode || !isValidAdminCodeFormat(defaultAdminCode)) {
-    console.error(
-      'ERROR: ADMIN_DEFAULT_CODE must be set to 4-64 non-whitespace characters for first-time database initialization.'
-    );
-    process.exit(1);
-  }
-
-  if (!fs.existsSync(DATA_DIR)) {
-    if (isRenderEnvironment()) {
-      console.error(`FATAL: Persistent disk directory "${DATA_DIR}" is unavailable on Render.`);
-      process.exit(1);
-    }
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-
-  const initialState = buildSeededDatabaseState(hashAdminCode(defaultAdminCode));
-  writeDatabaseStateAtomically(DB_FILE, initialState);
-  console.log(
-    `Initialized persistent database at ${DB_FILE} with salted scrypt hash of ADMIN_DEFAULT_CODE.`
-  );
-  console.log('Restart the application server if it is currently running.');
-  process.exit(0);
-}
-
-function runCliRecoverAdmin(codeArg: string | null, useDefault: boolean): never {
-  if (!fs.existsSync(DB_FILE)) {
-    console.error(
-      `ERROR: No persistent database exists at ${DB_FILE}. Run "npm run init-db" for first-time initialization.`
-    );
-    process.exit(1);
-  }
-
-  let parsed: unknown;
-  try {
-    const raw = fs.readFileSync(DB_FILE, 'utf-8');
-    parsed = JSON.parse(raw);
-  } catch (err: any) {
-    console.error(
-      `ERROR: Persistent database at ${DB_FILE} could not be read or parsed as JSON (${err?.message || err}). Refusing to overwrite existing data.`
-    );
-    process.exit(1);
-  }
-
-  if (!isValidPersistedDatabaseShape(parsed)) {
-    console.error(
-      `ERROR: Persistent database at ${DB_FILE} has an invalid schema. Refusing to overwrite existing data.`
-    );
-    process.exit(1);
-  }
-
-  let recoveryRaw = codeArg ?? process.env.ADMIN_RECOVERY_CODE ?? null;
-  if (!recoveryRaw && useDefault) {
-    recoveryRaw = getDefaultAdminCode();
-  }
-
-  if (!recoveryRaw) {
-    console.error(
-      'Usage: npm run recover-admin -- --code <NEW_ADMIN_CODE>  (or set ADMIN_RECOVERY_CODE, or pass --use-default to explicitly re-seed from ADMIN_DEFAULT_CODE).'
-    );
-    process.exit(1);
-  }
-
-  const normalizedCode = recoveryRaw.trim().toUpperCase();
-  if (!isValidAdminCodeFormat(normalizedCode)) {
-    console.error(
-      'ERROR: Recovery Admin Code must be 4-64 characters with no spaces or control characters.'
-    );
-    process.exit(1);
-  }
-
-  if (!parsed.config || typeof parsed.config !== 'object') {
-    parsed.config = { gameCode: 'APL2026' };
-  }
-  parsed.config.gameCode = 'APL2026';
-  if ('adminCode' in parsed.config) {
-    delete parsed.config.adminCode;
-  }
-  parsed.config.adminCodeHash = hashAdminCode(normalizedCode);
-
-  if (!Array.isArray(parsed.auditLogs)) {
-    parsed.auditLogs = [];
-  }
-  parsed.auditLogs.push({
-    id: `admin_recover_${Date.now()}`,
-    action: 'ADMIN_CODE_RECOVERED',
-    timestamp: new Date().toISOString(),
-    details: { message: 'Admin login code was explicitly recovered via CLI.' },
-  });
-
-  writeDatabaseStateAtomically(DB_FILE, parsed);
-  console.log(
-    `Recovered Admin Code hash in ${DB_FILE} while preserving all teams, players, purses, and auction state.`
-  );
-  console.log('Restart the application server if it is currently running.');
-  process.exit(0);
-}
-
 const cliFlags = parseCliFlags(process.argv.slice(2));
 if (cliFlags.command === 'init-db') {
-  runCliInitDb();
+  cliInitDatabase(DB_PATHS, buildSeededDatabaseState);
 } else if (cliFlags.command === 'recover-admin') {
-  runCliRecoverAdmin(cliFlags.code, cliFlags.useDefault);
+  cliRecoverAdmin(DB_PATHS, cliFlags.code, cliFlags.useDefault);
 }
-
-export type DatabaseStatus = 'ready' | 'missing' | 'corrupt' | 'missing_admin_hash';
 
 // Database Layer with File Persistence & Fail-Secure Authority
 class AuctionDatabase {
@@ -1000,100 +764,50 @@ class AuctionDatabase {
   private statusMessage = '';
 
   constructor() {
-    if (fs.existsSync(DB_FILE)) {
-      try {
-        const raw = fs.readFileSync(DB_FILE, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (!isValidPersistedDatabaseShape(parsed)) {
-          throw new Error('Invalid persistent database structure.');
-        }
-        this.state = parsed;
+    const loadResult = initializeOrLoadDatabase<DatabaseState>(
+      DB_PATHS,
+      buildSeededDatabaseState
+    );
 
-        if (!this.state.config || typeof this.state.config !== 'object') {
-          this.state.config = { gameCode: 'APL2026' };
-        }
-        // Ensure static game code is permanent and plaintext adminCode is never retained
-        this.state.config.gameCode = 'APL2026';
-        let needsSave = false;
-        if ('adminCode' in this.state.config) {
-          delete this.state.config.adminCode;
-          needsSave = true;
-        }
-        if (isValidAdminCodeHashFormat(this.state.config.adminCodeHash)) {
-          this.dbStatus = 'ready';
-          this.persistenceEnabled = true;
-          this.statusMessage = '';
-        } else {
-          // NEVER silently recreate or fall back to ADMIN_DEFAULT_CODE
-          delete this.state.config.adminCodeHash;
-          this.dbStatus = 'missing_admin_hash';
-          this.persistenceEnabled = true;
-          this.statusMessage =
-            'Persistent database is missing a valid adminCodeHash. Admin login is disabled; run explicit recovery ("npm run recover-admin -- --code <NEW_CODE>").';
-          console.error(`CRITICAL: ${this.statusMessage}`);
-        }
-
-        // Ensure teams have loginCode initialized
-        const defaultCodes: Record<string, string> = {
-          team_a: 'TEAMA777',
-          team_b: 'TEAMB777',
-          team_c: 'TEAMC777',
-          team_d: 'TEAMD777',
-        };
-        for (const team of this.state.teams) {
-          if (!team.loginCode) {
-            team.loginCode = defaultCodes[team.id] || `${team.code.replace(/\s+/g, '').toUpperCase()}777`;
-            needsSave = true;
-          }
-          if (team.adjustedBudget === undefined) {
-            team.adjustedBudget = team.baseBudget;
-            needsSave = true;
-          }
-        }
-        if (!this.state.activeAuction.biddingType) {
-          this.state.activeAuction.biddingType = 'online';
-          needsSave = true;
-        }
-        if (this.state.universalPurse === undefined) {
-          this.state.universalPurse = 800;
-          needsSave = true;
-        }
-        if (!Array.isArray(this.state.auditLogs)) {
-          this.state.auditLogs = [];
-          needsSave = true;
-        }
-        if (needsSave && this.dbStatus === 'ready') {
-          this.save();
-        }
-      } catch (e) {
-        this.dbStatus = 'corrupt';
-        this.persistenceEnabled = false;
-        this.statusMessage = `Persistent database file at ${DB_FILE} is unreadable or corrupted. Refusing to recreate default admin credentials.`;
-        console.error(`CRITICAL: ${this.statusMessage}`, e);
-        this.state = this.createEphemeralFallbackState();
-      }
-    } else {
-      this.dbStatus = 'missing';
-      this.persistenceEnabled = false;
-      this.statusMessage = `Persistent database not found at ${DB_FILE}. Run explicit first-time initialization ("npm run init-db") with ADMIN_DEFAULT_CODE configured.`;
-      console.error(`CRITICAL: ${this.statusMessage}`);
-      this.state = this.createEphemeralFallbackState();
+    if (loadResult.fatalStorageError) {
+      console.error(loadResult.message);
+      process.exit(1);
     }
 
-    this.syncImageUrls();
-    this.recalculateAllTeams(this.dbStatus === 'ready');
+    this.dbStatus = loadResult.status;
+    this.persistenceEnabled = loadResult.persistenceEnabled;
+    this.statusMessage = loadResult.message;
+    this.state = loadResult.state ?? this.createEphemeralFallbackState();
+
+    const imagesChanged = this.syncImageUrls();
+    const teamsChanged = this.recalculateAllTeams(false);
+    if (
+      this.dbStatus === 'ready' &&
+      this.persistenceEnabled &&
+      (loadResult.needsSave || imagesChanged || teamsChanged)
+    ) {
+      this.save();
+    }
   }
 
   // Keeps imageUrl AND name in an already-saved database in sync with the seed above,
   // so editing a photo path or a player name in getInitialPlayers() takes effect on restart without a DB reset.
-  private syncImageUrls() {
+  private syncImageUrls(): boolean {
+    let changed = false;
     const seed = new Map(getInitialPlayers().map((p) => [p.id, p]));
     for (const p of this.state.players) {
       const s = seed.get(p.id);
       if (!s) continue;
-      if (p.imageUrl !== s.imageUrl) p.imageUrl = s.imageUrl;
-      if (p.name !== s.name) p.name = s.name;
+      if (p.imageUrl !== s.imageUrl) {
+        p.imageUrl = s.imageUrl;
+        changed = true;
+      }
+      if (p.name !== s.name) {
+        p.name = s.name;
+        changed = true;
+      }
     }
+    return changed;
   }
 
   // Used only in memory when persistent DB is missing or corrupted; intentionally omits adminCodeHash and never saves to disk.
@@ -1133,20 +847,15 @@ class AuctionDatabase {
         'Database persistence is disabled because the persistent database is missing or corrupted.'
       );
     }
-    if (!fs.existsSync(DATA_DIR)) {
-      if (isRenderEnvironment()) {
-        throw new Error(`Persistent disk directory "${DATA_DIR}" is unavailable on Render.`);
-      }
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    writeDatabaseStateAtomically(DB_FILE, this.state);
+    saveDatabaseWithBackup(DB_PATHS, this.state);
   }
 
   public getState(): DatabaseState {
     return this.state;
   }
 
-  public recalculateAllTeams(shouldSave: boolean = true) {
+  public recalculateAllTeams(shouldSave: boolean = true): boolean {
+    let changed = false;
     for (const team of this.state.teams) {
       const teamPlayers = this.state.players.filter((p) => p.teamId === team.id);
       
@@ -1158,17 +867,28 @@ class AuctionDatabase {
       // Total value points
       const totalVal = teamPlayers.reduce((sum, p) => sum + p.valuePoints, 0);
 
-      team.totalSpent = auctionSpent;
       const effectiveBudget = team.adjustedBudget ?? team.baseBudget;
-      team.remainingBudget = Math.max(0, effectiveBudget - auctionSpent);
-      team.totalValue = totalVal;
-
+      const nextRemaining = Math.max(0, effectiveBudget - auctionSpent);
       const qual = calculateQualification(team.id, this.state.players);
+
+      if (
+        team.totalSpent !== auctionSpent ||
+        team.remainingBudget !== nextRemaining ||
+        team.totalValue !== totalVal ||
+        team.isQualified !== qual.isQualified
+      ) {
+        changed = true;
+      }
+
+      team.totalSpent = auctionSpent;
+      team.remainingBudget = nextRemaining;
+      team.totalValue = totalVal;
       team.isQualified = qual.isQualified;
     }
     if (shouldSave && this.persistenceEnabled) {
       this.save();
     }
+    return changed;
   }
 
   public updateTeamName(teamId: string, name: string) {
